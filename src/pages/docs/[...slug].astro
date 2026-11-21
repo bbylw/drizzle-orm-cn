@@ -3,6 +3,7 @@ import type { GetStaticPaths, InferGetStaticPropsType } from 'astro';
 import Layout from '@/layouts/Layout.astro';
 import { Docs } from '@/components/docs';
 import { source } from '@/lib/source';
+import { basePath } from '@/lib/shared';
 
 export const prerender = true;
 
@@ -30,7 +31,7 @@ const pageTree = await source.serializePageTree(source.getPageTree());
     title={page.data.title}
     description={page.data.description}
     toc={toc}
-    markdownUrl={`${page.url}.md`}
+    markdownUrl={`${page.url.slice(basePath.length - 1)}.md`}
   >
     <Content />
   </Docs>
