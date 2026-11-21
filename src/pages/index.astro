@@ -743,9 +743,9 @@ const quickLinks = [
     </main>
 
     <footer class="border-t border-white/[0.07]">
-      <div class="mx-auto w-full max-w-[1200px] px-5 py-14 md:px-8">
-        <div class="grid gap-10 md:grid-cols-[1.5fr_repeat(3,1fr)]">
-          <div>
+      <div class="mx-auto w-full max-w-[1200px] px-5 py-12 md:px-8 md:py-14">
+        <div class="grid grid-cols-2 gap-x-6 gap-y-9 md:grid-cols-[1.5fr_repeat(3,1fr)] md:gap-10">
+          <div class="col-span-2 md:col-span-1">
             <a href={basePath} class="inline-flex items-center gap-2.5" aria-label="Drizzle 首页">
               <img src={`${basePath}logo.svg`} alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
             </a>
@@ -753,36 +753,36 @@ const quickLinks = [
 
           <div>
             <p class="font-mono text-[10.5px] uppercase tracking-[0.16em] text-white/25">文档</p>
-            <ul class="mt-4 space-y-2.5 text-[13px]">
-              <li><a class="text-white/50 transition hover:text-brand" href={docsRoute}>概览</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={`${docsRoute}/quickstart`}>快速开始</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={`${docsRoute}/schema`}>Schema</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={`${docsRoute}/queries`}>查询</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={`${docsRoute}/migrations`}>迁移</a></li>
+            <ul class="mt-2 text-[13px] md:mt-4 md:space-y-2.5">
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={docsRoute}>概览</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={`${docsRoute}/quickstart`}>快速开始</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={`${docsRoute}/schema`}>Schema</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={`${docsRoute}/queries`}>查询</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={`${docsRoute}/migrations`}>迁移</a></li>
             </ul>
           </div>
 
           <div>
             <p class="font-mono text-[10.5px] uppercase tracking-[0.16em] text-white/25">资源</p>
-            <ul class="mt-4 space-y-2.5 text-[13px]">
-              <li><a class="text-white/50 transition hover:text-brand" href={officialDocs} target="_blank" rel="noreferrer">官方文档</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={officialSite} target="_blank" rel="noreferrer">Drizzle 官网</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={githubUrl} target="_blank" rel="noreferrer">GitHub</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={`${basePath}llms.txt`}>llms.txt</a></li>
+            <ul class="mt-2 text-[13px] md:mt-4 md:space-y-2.5">
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={officialDocs} target="_blank" rel="noreferrer">官方文档</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={officialSite} target="_blank" rel="noreferrer">Drizzle 官网</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={githubUrl} target="_blank" rel="noreferrer">GitHub</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={`${basePath}llms.txt`}>llms.txt</a></li>
             </ul>
           </div>
 
-          <div>
+          <div class="col-span-2 md:col-span-1">
             <p class="font-mono text-[10.5px] uppercase tracking-[0.16em] text-white/25">社区</p>
-            <ul class="mt-4 space-y-2.5 text-[13px]">
-              <li><a class="text-white/50 transition hover:text-brand" href={discordUrl} target="_blank" rel="noreferrer">Discord</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={twitterUrl} target="_blank" rel="noreferrer">X · @DrizzleORM</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={`${docsRoute}/faq`}>常见问题</a></li>
+            <ul class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-[13px] md:mt-4 md:block md:space-y-2.5">
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={discordUrl} target="_blank" rel="noreferrer">Discord</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={twitterUrl} target="_blank" rel="noreferrer">X · @DrizzleORM</a></li>
+              <li><a class="inline-block py-2 text-white/50 transition hover:text-brand md:py-0" href={`${docsRoute}/faq`}>常见问题</a></li>
             </ul>
           </div>
         </div>
 
-        <div class="mt-12 flex flex-col gap-2 border-t border-white/[0.07] pt-6 font-mono text-[10.5px] uppercase tracking-[0.12em] text-white/25 sm:flex-row sm:items-center sm:justify-between">
+        <div class="mt-10 flex flex-col gap-2 border-t border-white/[0.07] pt-6 font-mono text-[10.5px] uppercase tracking-[0.12em] text-white/25 sm:flex-row sm:items-center sm:justify-between md:mt-12">
           <span>© 2026 Drizzle · 非官方翻译</span>
           <span>built with astro · fumadocs · bun</span>
         </div>
