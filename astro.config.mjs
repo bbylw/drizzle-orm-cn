@@ -5,7 +5,7 @@ import fumadocs from '@fumadocs/astro';
 import mdastBaseLinks from './src/lib/mdast-base-links.mjs';
 
 export default defineConfig({
-  site: 'https://bbylw.github.io',
+  site: 'https://drizzle.ndjp.net',
   base: process.env.PAGES_BASE ?? '/',
   integrations: [
     fumadocs({
