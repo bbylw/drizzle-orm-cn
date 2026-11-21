@@ -1,0 +1,160 @@
+---
+title: sql`` 模板运算符
+description: 用 sql`` 模板标签编写原生 SQL 片段：嵌套组合、类型映射、sql.raw、占位符与预编译语句，以及防注入的正确姿势。
+---
+
+当内置运算符不够用时，`sql` 模板标签让你把任意 SQL 片段嵌入查询构建器。本页示例假设已有 `db` 实例与 `users`、`posts` 等 schema 表（见 [Schema 声明](/docs/schema)）。
+
+```ts
+import { sql } from 'drizzle-orm';
+
+const id = 69;
+await db.execute(sql`select * from ${users} where ${users.id} = ${id}`);
+// SQL: select * from "users" where "users"."id" = $1
+// 参数: [69]
+```
+
+模板中的插值会被智能处理：表与列展开为标识符，普通值变成绑定参数（`$1`、`?`），因此天然防 SQL 注入。
+
+## 在查询构建器中使用
+
+`sql` 片段可以出现在 `select`、`where`、`orderBy`、`groupBy`、`having` 等任何位置：
+
+```ts
+// select 中的计算列
+await db.select({
+  lowerName: sql<string>`lower(${users.name})`,
+}).from(users);
+
+// where 中使用数据库特有能力（PG 全文搜索）
+await db.select().from(users).where(
+  sql`to_tsvector('simple', ${users.name}) @@ to_tsquery('simple', ${searchParam})`,
+);
+
+// orderBy / groupBy / having
+await db.select().from(users).orderBy(sql`${users.id} desc nulls first`);
+await db.select({ postId: comments.postId }).from(comments)
+  .groupBy(sql`${comments.postId}`)
+  .having(sql`count(${comments.id}) > 300`);
+```
+
+<Callout type="info" title="sql<T> 只影响类型">
+`sql<string>` 中的泛型只是 TypeScript 类型标注，不做任何运行时转换。需要真正的值映射请用 `.mapWith()`。
+</Callout>
+
+## 嵌套与组合
+
+`sql` 片段本身可以插进另一个 `sql` 片段，Drizzle 会递归展开并统一参数化：
+
+```ts
+const filter = sql`${users.name} = ${'Dan'}`;
+const query = sql`select * from ${users} where ${filter}`;
+```
+
+组合多个片段的工具函数：
+
+```ts
+import { sql, type SQL } from 'drizzle-orm';
+
+const chunks: SQL[] = [sql`select * from ${users}`, sql`where ${users.id} = ${1}`];
+
+// 拼接片段数组
+const joined = sql.join(chunks, sql.raw(' '));
+// 从数组构造
+const fromList = sql.fromList(chunks);
+// 追加片段
+const appended = sql`select * from ${users}`.append(sql` where ${users.id} = ${1}`);
+// 空片段，适合作为累加起点
+const empty = sql.empty();
+```
+
+## 类型映射与别名
+
+```ts
+// 复用列的 mapFromDriverValue（如 timestamp、json 的解码逻辑）
+sql`...`.mapWith(posts.createdAt);
+// 自定义映射函数
+sql`...`.mapWith(Number);
+sql`...`.mapWith({ mapFromDriverValue: (v: string) => JSON.parse(v) });
+
+// 作为子查询/计算列时必须起别名
+const lowerName = sql<string>`lower(${users.name})`.as('lower_name');
+await db.select({ lowerName }).from(users);
+```
+
+## sql.raw：跳过参数化
+
+`sql.raw()` 把字符串原样拼进 SQL，不转义、不参数化：
+
+```ts
+await db.execute(sql.raw(`select * from users where id = ${12}`));
+```
+
+<Callout type="error" title="注入风险">
+绝不要把用户输入传给 `sql.raw()` 或拼进模板字符串。只有完全可信的常量（如动态排序方向白名单）才适合 raw。普通值一律走 `${value}` 插值，让驱动做参数绑定。
+</Callout>
+
+## 占位符与预编译语句
+
+`sql.placeholder()` 在 SQL 中留一个命名参数，配合 `.prepare()` 生成可复用的预编译语句，多次执行时省去重复构建与解析：
+
+```ts
+import { eq, sql } from 'drizzle-orm';
+
+const prepared = db
+  .select()
+  .from(users)
+  .where(eq(users.id, sql.placeholder('id')))
+  .prepare('get_user');
+
+await prepared.execute({ id: 1 });
+await prepared.execute({ id: 2 });
+```
+
+关系查询同样支持占位符（`where`、`limit`、`offset`）：
+
+```ts
+const prepared = db.query.users.findMany({
+  where: { id: { eq: sql.placeholder('id') } },
+  limit: sql.placeholder('limit'),
+}).prepare('users_page');
+
+await prepared.execute({ id: 1, limit: 10 });
+```
+
+## SQL 注释（sqlcommenter）
+
+PostgreSQL 与 MySQL 的 `select` / `insert` / `update` / `delete` 支持 `.comment()`，在语句末尾追加 [sqlcommenter](https://google.github.io/sqlcommenter) 格式注释，便于追踪与调试：
+
+```ts
+db.select().from(users).comment('my_first_tag');
+// select "id", "name" from "users" /*my_first_tag*/
+
+db.select().from(users).comment({ route: '/api/users', trace: true });
+// ... /*route='%2Fapi%2Fusers',trace='true'*/
+
+db.insert(users).values({ name: 'Dan' }).comment({ operation: 'seed' });
+```
+
+<Callout type="warn" title="注释必须在 prepare 之前">
+预编译语句的 SQL 在 prepare 时就固定了，`.prepare()` 之后不能再 `.comment()`。请先加注释再 prepare。SQLite 文档未提供此 API。
+</Callout>
+
+## 调试：查看生成的 SQL
+
+```ts
+import { PgDialect } from 'drizzle-orm/pg-core';
+
+const { sql: query, params } = new PgDialect().sqlToQuery(
+  sql`select * from ${users} where ${users.id} = ${1}`,
+);
+// query: 'select * from "users" where "users"."id" = $1', params: [1]
+```
+
+任何查询构建器也都有 `.toSQL()` 方法，返回同样的 `{ sql, params }` 结构。
+
+## 延伸阅读
+
+- [条件运算符](/docs/operators)：`eq`、`and`、`exists` 等内置运算符
+- [查询工具](/docs/query-utils)：`$count` 等辅助 API
+- [动态查询构建](/docs/dynamic)：把 `sql` 片段用于可选过滤条件

@@ -1,0 +1,149 @@
+---
+title: 在已有项目中使用 Drizzle
+description: 用 drizzle-kit pull 内省旧库生成 schema，渐进接管部分表，并对齐迁移基线。
+---
+
+已有数据库不代表要从零重建。Drizzle 支持 **database first**（数据库是事实来源，用 `pull` 拉取 schema）与 **codebase first**（代码是事实来源，用 `generate`/`push` 推送变更）两种路线，可以按表渐进采用。
+
+## 接入步骤
+
+<Steps>
+<Step>
+
+### 安装依赖
+
+```bash
+npm i drizzle-orm pg dotenv
+npm i -D drizzle-kit tsx @types/pg
+```
+
+MySQL/SQLite 项目把 `pg` 换成对应驱动，见 [连接数据库](/docs/connections)。
+
+</Step>
+<Step>
+
+### 配置连接与 drizzle.config.ts
+
+```bash title=".env"
+DATABASE_URL=postgres://user:password@host:5432/existing_db
+```
+
+```ts title="drizzle.config.ts"
+import 'dotenv/config';
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  out: './drizzle',
+  schema: './src/db/schema.ts',
+  dialect: 'postgresql',
+  dbCredentials: { url: process.env.DATABASE_URL! },
+});
+```
+
+</Step>
+<Step>
+
+### 内省数据库
+
+```bash
+npx drizzle-kit pull
+```
+
+生成 `drizzle/schema.ts`（表、列、索引、约束）、`drizzle/relations.ts`（关系查询用）以及 `meta` 快照与一份 SQL 迁移。v1 中可用 `npx drizzle-kit pull --init`：它会创建迁移历史表，并把首个 pull 出的迁移标记为已应用——这正是旧库需要的**基线**。0.x 中对应命令名为 `drizzle-kit introspect`。
+
+</Step>
+<Step>
+
+### 把生成的 schema 移入项目
+
+官方建议把 `drizzle/schema.ts` 与 `drizzle/relations.ts` 的内容转移到 `src/db/` 下自行维护，生成文件可删除。生成的代码形如：
+
+```ts title="src/db/schema.ts"
+import { pgTable, unique, integer, varchar } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  name: varchar({ length: 255 }).notNull(),
+  email: varchar({ length: 255 }).notNull(),
+}, (table) => [
+  unique('users_email_unique').on(table.email),
+]);
+```
+
+</Step>
+<Step>
+
+### 初始化客户端并查询
+
+```ts title="src/index.ts"
+import 'dotenv/config';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { eq } from 'drizzle-orm';
+import { users } from './db/schema';
+
+const db = drizzle(process.env.DATABASE_URL!);
+
+const rows = await db.select().from(users).where(eq(users.id, 1));
+```
+
+到此旧库已具备类型安全查询，无需改动任何表结构。
+
+</Step>
+<Step>
+
+### 演进 schema
+
+改 `src/db/schema.ts` 后，开发期可 `npx drizzle-kit push` 快速迭代；正式变更走 `npx drizzle-kit generate` + `npx drizzle-kit migrate`，见 [迁移](/docs/migrations)。
+
+</Step>
+</Steps>
+
+## pull 生成 vs 手写 schema
+
+- **pull 生成**：忠实还原旧库（约束名、序列、默认值一应俱全），适合接管存量库；缺点是命名与组织按数据库现状，未必符合代码习惯。
+- **手写**：结构清晰、可加 `$type` 等代码层增强，但要自己保证与数据库一致，漏写约束会在 `generate` 时产生意外 diff。
+- 实践建议：先 pull 打底，再逐步重命名变量、拆分文件；**数据库对象名（表名/列名）保持不变**，只改 TypeScript 侧标识符。
+
+## 渐进采用：只接管部分表
+
+Drizzle 不要求一次性声明所有表。只把要接管的表写进 schema 即可查询；但要注意 kit 的 diff 行为：
+
+<Callout type="warn" title="未声明的表可能被判定为删除">
+`generate`/`push` 以 schema 与快照的差集生成变更。若快照里存在而 schema 未声明的表，会被生成 `DROP TABLE`。接管部分表时：用 `schemaFilter` 限定 kit 管理的范围，或确保未接管的表不出现在快照中；执行前务必审查生成的 SQL。
+</Callout>
+
+```ts title="drizzle.config.ts"
+export default defineConfig({
+  // 只管理指定 schema；v1 支持 glob，且默认管理所有 schema
+  schemaFilter: ['public', 'app_*'],
+});
+```
+
+v1 中 `push`/`pull` 默认管理**所有** schema（0.x 默认仅 `public`），旧项目升级时要显式配置 `schemaFilter`，避免把其他 schema 的表卷进来。
+
+## 迁移基线（baseline）
+
+旧库已有数据与结构，迁移历史必须与之对齐，否则首次 `migrate` 会试图重建所有表：
+
+- **v1 推荐**：`npx drizzle-kit pull --init` 自动创建迁移表并把首个迁移标记为已应用，后续 `generate` 只产出增量。
+- **0.x 做法**：`introspect` 后把生成的首份迁移视为基线，手工向 `__drizzle_migrations` 表插入对应记录（hash 与创建时间取自 `meta/_journal.json`），或干脆用 `push` 管理、不启用迁移历史。
+- **外部工具管理的库**（Flyway、Liquibase 等）：保持 database first，定期 `pull` 同步 schema，Drizzle 只做查询层，不接管迁移。
+
+<Callout type="info" title="基线原则">
+基线迁移的内容应等于「当前数据库结构」，且永远不再执行。之后的每次变更都是相对基线的增量 SQL。
+</Callout>
+
+## 类型安全接入清单
+
+1. `pull` 后核对列类型映射：`numeric`/`bigint` 默认推断为 `string`，时间戳注意 `mode`，见 [常见陷阱](/docs/gotchas)。
+2. 为代码层收窄类型用 `.$type<T>()`（仅编译期，不做运行时校验）。
+3. 关系查询需要 `relations` 定义；v1 使用 `defineRelations`，见 [升级到 v1](/docs/upgrade-v1)。
+4. 把 `db` 实例与 schema 统一从 `src/db/index.ts` 导出，避免多处初始化连接池。
+
+## 下一步
+
+<Cards>
+  <Card title="Drizzle Kit" href="/docs/drizzle-kit" description="pull/generate/push/migrate 命令详解" />
+  <Card title="迁移" href="/docs/migrations" description="迁移工作流与团队协作" />
+  <Card title="升级到 v1" href="/docs/upgrade-v1" description="kit 重写与迁移格式变化" />
+</Cards>

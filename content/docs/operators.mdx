@@ -1,0 +1,167 @@
+---
+title: 运算符
+description: Drizzle 过滤运算符速查：eq、inArray、like、between、exists、and/or/not 与 PostgreSQL 数组运算符，全部参数化、可组合。
+---
+
+所有运算符都从 `drizzle-orm` 导入，返回值自动参数化，可出现在 `where()`、`having()`、join 的 `on` 条件以及 `onConflictDoUpdate` 的 where 中。本页示例沿用[快速开始](/docs/quickstart)中的 `db` 与 `users`、`posts`、`orders` 表。
+
+```ts
+import {
+  eq, ne, gt, gte, lt, lte,
+  like, notLike, ilike, notIlike,
+  inArray, notInArray, isNull, isNotNull,
+  between, notBetween, exists, notExists,
+  and, or, not,
+} from 'drizzle-orm';
+```
+
+## 速查表
+
+| 运算符 | SQL 等价 | 一行示例 |
+| --- | --- | --- |
+| `eq(a, b)` | `=` | `eq(users.id, 1)` |
+| `ne(a, b)` | `<>` | `ne(users.role, 'admin')` |
+| `gt(a, b)` | `>` | `gt(users.age, 18)` |
+| `gte(a, b)` | `>=` | `gte(users.age, 18)` |
+| `lt(a, b)` | `<` | `lt(users.age, 65)` |
+| `lte(a, b)` | `<=` | `lte(users.age, 65)` |
+| `like(a, p)` | `LIKE`（区分大小写） | `like(users.name, '%Dan%')` |
+| `notLike(a, p)` | `NOT LIKE` | `notLike(users.name, '%test%')` |
+| `ilike(a, p)` | `ILIKE`（不区分大小写，PG） | `ilike(users.name, '%dan%')` |
+| `notIlike(a, p)` | `NOT ILIKE`（PG） | `notIlike(users.name, '%dan%')` |
+| `inArray(a, arr)` | `IN (...)` | `inArray(users.id, [1, 2, 3])` |
+| `notInArray(a, arr)` | `NOT IN (...)` | `notInArray(users.role, ['banned'])` |
+| `isNull(a)` | `IS NULL` | `isNull(users.deletedAt)` |
+| `isNotNull(a)` | `IS NOT NULL` | `isNotNull(users.email)` |
+| `between(a, lo, hi)` | `BETWEEN`（含边界） | `between(users.age, 18, 30)` |
+| `notBetween(a, lo, hi)` | `NOT BETWEEN` | `notBetween(users.age, 18, 30)` |
+| `exists(q)` | `EXISTS (subquery)` | `exists(db.select().from(posts))` |
+| `notExists(q)` | `NOT EXISTS` | `notExists(db.select().from(posts))` |
+| `and(...conds)` | `AND` 连接 | `and(eq(users.id, 1), isNotNull(users.email))` |
+| `or(...conds)` | `OR` 连接 | `or(eq(users.role, 'admin'), eq(users.role, 'owner'))` |
+| `not(cond)` | `NOT (...)` | `not(eq(users.role, 'banned'))` |
+
+## 比较运算符：列对列
+
+`eq`/`ne`/`gt`/`gte`/`lt`/`lte` 的第二个参数既可以是值，也可以是另一列（同表或 join 进来的表）：
+
+```ts
+// 值比较
+await db.select().from(users).where(eq(users.name, 'Dan'));
+
+// 列对列比较
+await db.select().from(users).where(eq(users.createdAt, users.updatedAt));
+```
+
+## NULL 判断
+
+SQL 中 `= null` 永远不成立，判空必须用 `isNull` / `isNotNull`：
+
+```ts
+await db.select().from(users).where(isNull(users.deletedAt));
+```
+
+## 模糊匹配与方言差异
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+`like` 区分大小写，`ilike` 不区分大小写，四个都可用：
+
+```ts
+await db.select().from(users).where(ilike(users.name, '%dan%'));
+```
+
+</Tab>
+<Tab value="MySQL">
+
+没有 `ilike`/`notIlike`。`like` 是否区分大小写由列的 collation 决定（常见的 `*_ci` collation 本身就不区分大小写）。
+
+</Tab>
+<Tab value="SQLite">
+
+没有 `ilike`/`notIlike`。`LIKE` 对 ASCII 字符默认不区分大小写。
+
+</Tab>
+</Tabs>
+
+## inArray：数组或子查询
+
+第二个参数可以是值数组，也可以是**单列**的子查询：
+
+```ts
+await db.select().from(users).where(inArray(users.id, [1, 2, 3]));
+
+await db.select().from(users).where(
+  inArray(users.id, db.select({ id: posts.authorId }).from(posts)),
+);
+```
+
+`notInArray` 同理。注意 SQL 语义：`NOT IN` 的子查询结果若含 `NULL`，整个条件不会匹配任何行，子查询侧记得 `isNotNull` 过滤。
+
+## between 与 exists
+
+```ts
+await db.select().from(users).where(between(users.age, 18, 30)); // 含 18 和 30
+
+// 有订单的用户；子查询可引用外层表列（相关子查询）
+await db.select().from(users).where(
+  exists(db.select().from(orders).where(eq(orders.userId, users.id))),
+);
+```
+
+## 逻辑组合与条件过滤
+
+`and`/`or`/`not` 可任意嵌套，并且**自动忽略 `undefined` 参数**——这是实现可选过滤的官方推荐写法：
+
+```ts
+const rows = await db.select().from(users).where(
+  and(
+    eq(users.role, 'member'),
+    name ? ilike(users.name, `%${name}%`) : undefined, // 没传 name 就不加这条
+    or(isNull(users.bannedAt), gt(users.bannedAt, new Date())),
+  ),
+);
+```
+
+<Callout type="info" title="组合无处不在">
+运算符返回的 SQL 片段可复用在任何条件位置：`where()`、`having()`、`leftJoin(t, and(...))` 的 on 条件、`db.$count(users, eq(...))` 的过滤参数等。
+</Callout>
+
+## PostgreSQL 数组运算符
+
+针对 PG 的数组列（如 `text('tags').array()`），从 `drizzle-orm` 导入：
+
+| 运算符 | SQL 等价 | 含义 |
+| --- | --- | --- |
+| `arrayContains(a, vals)` | `@>` | 列包含全部给定元素 |
+| `arrayContained(a, vals)` | `<@` | 列的元素全部在给定集合内 |
+| `arrayOverlaps(a, vals)` | `&&` | 列与给定集合有交集 |
+
+```ts
+import { arrayContains, arrayContained, arrayOverlaps } from 'drizzle-orm';
+
+await db.select({ id: posts.id }).from(posts)
+  .where(arrayContains(posts.tags, ['Typescript', 'ORM']));
+
+await db.select().from(posts).where(arrayContained(posts.tags, ['SQL', 'ORM', 'Typescript']));
+
+await db.select().from(posts).where(arrayOverlaps(posts.tags, ['SQL', 'ORM']));
+```
+
+三个运算符的第二个参数同样可以传单列子查询（子查询需返回数组列）。
+
+## 超出内置运算符时
+
+内置运算符覆盖不了的场景（如 PG 全文检索 `@@`、JSON 操作符），用 `sql` 模板自行构造，值插值依旧参数化：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.select().from(posts).where(sql`${posts.searchVector} @@ plainto_tsquery(${keyword})`);
+```
+
+<Cards>
+  <Card title="SQL Select" href="/docs/select" description="where、having 与动态查询构建。" />
+  <Card title="Joins" href="/docs/joins" description="在 on 条件中组合运算符。" />
+</Cards>

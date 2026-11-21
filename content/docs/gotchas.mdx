@@ -1,0 +1,135 @@
+---
+title: 常见陷阱
+description: 默认值与 $default、timestamp 模式、SQLite 布尔、join 结果形状、迁移不可变等高频坑点与规避代码。
+---
+
+<Callout type="info" title="关于本页">
+官方 `/docs/gotchas` 目前仍是占位页（「will be a library of gotchas」）。以下条目整理自官方 column-types、joins、migrations、count-rows 与各驱动连接文档中明确记载的行为，并附规避代码。
+</Callout>
+
+## `default` 与 `$default` 不是一回事
+
+`.default()` 生成数据库端 `DEFAULT` 子句，进迁移文件；`.$default()` / `.$defaultFn()` 只在 **Drizzle 运行时**的 insert 中填充值，**不影响 drizzle-kit**，数据库里没有任何默认值。绕过 Drizzle 写入（原生 SQL、其他服务）时 `$default` 不生效。
+
+```ts
+export const users = pgTable('users', {
+  // 数据库默认：任何写入路径都生效
+  createdAt: timestamp().defaultNow(),
+  // 运行时默认：仅 Drizzle insert 生效，DDL 无 DEFAULT
+  id: text().$defaultFn(() => createId()),
+});
+```
+
+需要「更新时自动刷新」用 `.$onUpdate(() => new Date())`，同样是运行时行为。
+
+## timestamp 的 mode 与时区
+
+`timestamp({ mode: 'date' })` 推断为 `Date`，Drizzle 负责双向映射；`mode: 'string'` 原样透传字符串，不做任何转换。`withTimezone: true` 决定 `timestamptz`，存储值始终是 UTC。
+
+```ts
+export const events = pgTable('events', {
+  at: timestamp({ mode: 'date', withTimezone: true }), // Date
+  raw: timestamp({ mode: 'string' }), // string，自行解析
+});
+```
+
+坑点：`timestamp without time zone` 会**静默忽略**写入值携带的时区信息；跨时区业务一律用 `withTimezone: true`。
+
+## SQLite 没有原生 boolean
+
+SQLite 的布尔要声明为 `integer({ mode: 'boolean' })`，Drizzle 在代码层映射 `true/false`，数据库存 0/1。直接写 SQL 查询时记得条件是 `= 1` 而不是 `= true`。
+
+```ts
+export const flags = sqliteTable('flags', {
+  enabled: integer({ mode: 'boolean' }).notNull().default(false),
+  // integer 还支持 timestamp / timestamp_ms 模式
+  seenAt: integer({ mode: 'timestamp' }),
+});
+```
+
+## join 结果是「平铺行」，不是嵌套对象
+
+`db.select().from(users).leftJoin(pets, ...)` 返回按表名分组的平铺对象数组；left join 时从表可能整体为 `null`。一对多 join 会产生多行（用户重复出现），需要嵌套结构请用关系查询 `db.query.users.findMany({ with: { posts: true } })`。
+
+```ts
+const rows = await db.select().from(users)
+  .leftJoin(pets, eq(users.id, pets.ownerId));
+// 类型：{ users: {...}; pets: {...} | null }[]
+```
+
+## PostgreSQL 的 count 与 bigint 返回字符串
+
+`count(*)` 在 PG 中是 `bigint`，驱动按字符串返回。用 `count()` 辅助函数（运行时自动转 number），或 `mapWith`：
+
+```ts
+import { count, sql } from 'drizzle-orm';
+
+await db.select({ n: count() }).from(users); // number
+await db.select({ n: sql`count(*)`.mapWith(Number) }).from(users);
+```
+
+`bigint` 列同理：`bigint({ mode: 'number' })` 有精度风险，大整数用 `mode: 'bigint'`。`numeric` 默认也是字符串。
+
+## 已应用的迁移不可变
+
+迁移文件一旦在任何环境执行过，就**不要再编辑、删除或重排**——历史表按内容哈希/文件夹名记录，改动会导致校验失败或重复执行。写错了就生成一个新迁移去修正。
+
+```bash
+# 正确：追加修正迁移
+npx drizzle-kit generate
+```
+
+v1 的 `drizzle-kit check` 会检测跨分支冲突；删除已应用迁移可能迫使运行过它的数据库重置。
+
+## relations 声明不会创建外键
+
+`relations()`（v1 的 `defineRelations`）只服务于关系查询，**不产生任何 DDL**。真正的引用完整性要靠列上的 `.references()`：
+
+```ts
+export const posts = pgTable('posts', {
+  authorId: integer().notNull().references(() => users.id),
+});
+```
+
+只写 relations 不写 references，数据库不会阻止脏引用。
+
+## Neon HTTP 不支持交互式事务
+
+`drizzle-orm/neon-http` 面向单条非交互查询；`db.transaction` 回调里「先查再决定写」的模式需要 WebSocket 驱动 `drizzle-orm/neon-serverless`，或改用 `db.batch()` 一次提交。详见 [提供商页](/docs/providers-postgres)。
+
+## 事务型连接池必须关闭预编译
+
+postgres.js 经过 PgBouncer/Supabase/Appwrite 的 **transaction 池模式**时，prepared statements 会跨连接错乱：
+
+```ts
+const client = postgres(process.env.DATABASE_URL!, { prepare: false });
+```
+
+直连或 session 模式则无需关闭。迁移与内省建议始终走直连。
+
+## D1 用 batch，不要指望交互式事务
+
+Cloudflare D1 不支持交互式事务，多语句原子执行用 `db.batch()`；Drizzle 的 D1 事务基于 batch，回调内读不到真实执行结果。每条查询还是一次网络往返，注意合并。
+
+```ts
+const [inserted] = await db.batch([
+  db.insert(users).values({ name: 'Dan' }).returning(),
+  db.update(counters).set({ n: sql`${counters.n} + 1` }),
+]);
+```
+
+## insert/update 中 undefined 与 null 语义不同
+
+`.values()` / `.set()` 里字段为 `undefined` 会被**忽略**（insert 时落到数据库默认值），`null` 才是显式写 NULL。想清空一列必须传 `null`；可选列的 TS 类型也据此区分。
+
+## push 适合原型，生产走迁移
+
+`drizzle-kit push` 直接改库，可能产生删列/删表等数据丢失语句（v1 默认严格确认，`--force` 才会跳过）。生产环境用 `generate` + `migrate`，并审查 SQL；旧库接管时注意 `schemaFilter`，避免把未声明的表判定为删除，见 [已有项目接入](/docs/existing-project)。
+
+## 下一步
+
+<Cards>
+  <Card title="Schema" href="/docs/schema" description="列类型与默认值定义" />
+  <Card title="FAQ" href="/docs/faq" description="其他常见问题" />
+  <Card title="迁移" href="/docs/migrations" description="安全的 schema 演进" />
+</Cards>

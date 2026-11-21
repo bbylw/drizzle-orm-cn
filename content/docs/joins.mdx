@@ -1,0 +1,172 @@
+---
+title: Joins
+description: Drizzle join 完整参考：inner/left/right/full/cross 与 lateral、多表与子查询 join、自连接别名、嵌套结果类型与关系查询的取舍。
+---
+
+join 用于按关联列把多张表拼进一条 SQL。Drizzle 的 join 语法在 SQL 直译与类型安全之间取平衡：**结果默认按表名嵌套成对象**，可空性由 join 类型自动推导。本页使用如下 schema：
+
+```ts title="src/db/schema.ts"
+import { integer, pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: serial().primaryKey(),
+  name: text().notNull(),
+  age: integer(),
+});
+
+export const pets = pgTable('pets', {
+  id: serial().primaryKey(),
+  name: text().notNull(),
+  ownerId: integer('owner_id').notNull().references(() => users.id),
+});
+```
+
+## Join 类型一览
+
+| 方法 | SQL | 结果中哪侧可为 null |
+| --- | --- | --- |
+| `innerJoin(t, on)` | `INNER JOIN` | 两侧都非空 |
+| `leftJoin(t, on)` | `LEFT JOIN` | 右表对象整体为 `... 或 null` |
+| `rightJoin(t, on)` | `RIGHT JOIN` | 左表对象整体为 `... 或 null` |
+| `fullJoin(t, on)` | `FULL JOIN` | 两侧都可能为 null |
+| `crossJoin(t)` | `CROSS JOIN` | 无 on 条件，笛卡尔积 |
+
+```ts
+import { eq } from 'drizzle-orm';
+import { db } from './db';
+import { users, pets } from './db/schema';
+
+const result = await db.select().from(users)
+  .leftJoin(pets, eq(users.id, pets.ownerId));
+
+// 结果类型：每行一个嵌套对象
+// { users: { id: number; name: string; age: number | null };
+//   pets: { id: number; name: string; ownerId: number } | null }[]
+```
+
+没有宠物的用户仍会出现在结果里，`pets` 为 `null`——类型系统如实反映了这一点。`innerJoin` 则两侧都非空；`rightJoin`/`fullJoin` 镜像处理。
+
+## 多表 join
+
+链式追加即可，on 条件可以引用前面任何一张表。下例中 `usersToChatGroups` 是含 `userId`、`groupId` 两列的多对多中间表：
+
+```ts
+// 多对多：用户 ↔ 中间表 ↔ 群组
+await db.select()
+  .from(usersToChatGroups)
+  .leftJoin(users, eq(usersToChatGroups.userId, users.id))
+  .leftJoin(chatGroups, eq(usersToChatGroups.groupId, chatGroups.id))
+  .where(eq(chatGroups.id, 1));
+```
+
+## 部分选择：扁平与嵌套结果
+
+不想要按表嵌套时，用 `select({...})` 自定义结果形状：
+
+```ts
+const rows = await db.select({
+  userId: users.id,
+  petId: pets.id, // leftJoin 下自动推导为 number | null
+}).from(users).leftJoin(pets, eq(users.id, pets.ownerId));
+// { userId: number; petId: number | null }[]
+```
+
+列多时可用**嵌套 select 对象**：整个对象可空，而不是每个字段都可空，类型更干净：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.select({
+  userId: users.id,
+  userName: users.name,
+  pet: {
+    id: pets.id,
+    name: pets.name,
+    upperName: sql<string>`upper(${pets.name})`,
+  },
+}).from(users).fullJoin(pets, eq(users.id, pets.ownerId));
+// pet 整体为 { ... } | null
+```
+
+<Callout type="warn" title="sql 表达式的可空性要自己标">
+`sql` 表达式列不会自动获得 null 推导。leftJoin 的右表列做表达式时，显式写 `sql<string | null>`，否则结果类型不准确（不写泛型则是 unknown）。
+</Callout>
+
+## join 子查询与 LATERAL
+
+任何 `.as('别名')` 的子查询都能当表 join：
+
+```ts
+import { lt } from 'drizzle-orm';
+
+const youngPets = db.select().from(pets).where(lt(pets.id, 100)).as('young_pets');
+await db.select().from(users).leftJoin(youngPets, eq(users.id, youngPets.ownerId));
+```
+
+<Tabs items={['PostgreSQL', 'MySQL / SQLite']}>
+<Tab value="PostgreSQL">
+
+PG 支持 `LATERAL`：子查询可以引用左侧表的列。对应 `leftJoinLateral` / `innerJoinLateral` / `crossJoinLateral`：
+
+```ts
+import { gte, sql } from 'drizzle-orm';
+
+const subquery = db.select().from(pets).where(gte(users.age, 16)).as('user_pets');
+await db.select().from(users).leftJoinLateral(subquery, sql`true`);
+// left join lateral (select ... from "pets" where "users"."age" >= 16) "user_pets" on true
+```
+
+</Tab>
+<Tab value="MySQL / SQLite">
+
+MySQL 8.0.14+ 原生支持 LATERAL 派生表，但 Drizzle 的 MySQL/SQLite 构建器未提供 lateral 链式方法；可用普通子查询 join 或 ``sql`` 模板表达。SQLite 不支持 LATERAL，用相关子查询改写。
+
+</Tab>
+</Tabs>
+
+## 自连接与表别名
+
+同一张表 join 自己必须起别名，`alias()` 从各方言的 core 包导入：
+
+```ts
+import { alias } from 'drizzle-orm/pg-core';
+
+// users 表含 parentId 自引用列
+const parent = alias(users, 'parent');
+const rows = await db.select().from(users)
+  .leftJoin(parent, eq(parent.id, users.parentId));
+// { users: {...}; parent: {...} | null }[]
+```
+
+别名同样可用于 update … from（见 [SQL Update](/docs/update)）。
+
+## 聚合扁平行
+
+join 结果是"每行一条组合"的扁平数据，一对多会重复左表行。需要"一个用户带宠物数组"时自行归并：
+
+```ts
+const rows = await db.select({ user: users, pet: pets })
+  .from(users).leftJoin(pets, eq(users.id, pets.ownerId));
+
+const byUser: Record<number, { user: typeof users.$inferSelect; pets: (typeof pets.$inferSelect)[] }> = {};
+for (const { user, pet } of rows) {
+  byUser[user.id] ??= { user, pets: [] };
+  if (pet) byUser[user.id].pets.push(pet); // leftJoin 无匹配时 pet 为 null
+}
+```
+
+也可在 SQL 端用 `json_agg`/`array_agg` 聚合（配合 `sql` 模板与 `groupBy`），把归并交给数据库。
+
+## join 还是关系查询？
+
+| 场景 | 建议 |
+| --- | --- |
+| 需要过滤/排序/聚合关联表的列，精确控制一条 SQL | join（本页） |
+| 只是"取实体及其关联"，想要嵌套 JSON 结果 | [关系查询 RQB](/docs/relations)，免写 on 条件与归并逻辑 |
+
+两者可以混用：列表页用 join 做筛选分页，详情页用 RQB 取完整关联树。
+
+<Cards>
+  <Card title="SQL Select" href="/docs/select" description="select 对象决定 join 结果形状。" />
+  <Card title="运算符" href="/docs/operators" description="on 条件中组合 and/or。" />
+</Cards>

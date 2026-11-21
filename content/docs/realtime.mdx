@@ -1,0 +1,188 @@
+---
+title: 实时查询（Drizzle Pulse）
+description: Drizzle Pulse 通过 PostgreSQL 逻辑复制把查询结果常驻内存：live collections 与 CDC 事件流的定义、服务端 setup 与关键注意点。
+---
+
+**Drizzle Pulse** 让应用与 PostgreSQL 数据库保持同步：你用 Drizzle 表上的查询描述关心的行（例如「所有已接单的订单」），Pulse 把这些行保存在内存中，并在每次事务提交后很快更新它们。
+
+它是一个**运行在你现有服务进程内**的库，紧挨着请求处理器，连接应用已在用的数据库——不需要额外部署和运维服务。典型用途：
+
+- 用始终最新的内存行列表响应请求（如调度屏上的待处理订单）；
+- 把变更推送给已连接的客户端（WebSocket / SSE）；
+- 数据变化时执行代码（发通知、更新搜索索引）。
+
+应用照常写库；Pulse 直接从 PostgreSQL 读取变更，因此**其他服务、脚本、手工 SQL 的改动也能被看到**。
+
+<Callout type="warn" title="可用性状态">
+Pulse 目前仅支持 PostgreSQL，需要 Node.js 20+，且依赖 `drizzle-orm` 1.0 RC 线（`^1.0.0-rc.6`，安装时用 `drizzle-orm@rc`）。这是较新的能力，API 可能随 RC 版本演进，升级前请核对官方文档。
+</Callout>
+
+## 安装
+
+```bash
+npm i drizzle-pulse drizzle-orm@rc
+# 描述查询参数需要 Standard Schema 兼容的校验库，官方示例用 zod
+npm i zod
+```
+
+包有两个入口：`drizzle-pulse` 提供 `pulse()` 用于定义查询；`drizzle-pulse/embedded` 提供运行时。
+
+## 定义实时查询
+
+用 `pulse(table)` 包装普通 Drizzle 表得到 Pulse 表；它本身就是「匹配全表」的查询。源表必须有**单一主键列**（不支持复合主键），类型限于整型 / serial / text / varchar / char / uuid 等。
+
+```ts title="queries.ts"
+import { integer, pgTable, serial, text } from 'drizzle-orm/pg-core';
+import { pulse } from 'drizzle-pulse';
+import { z } from 'zod';
+
+export const orders = pgTable('orders', {
+  id: serial('id').primaryKey(),
+  driverId: integer('driver_id'),
+  status: text('status', { enum: ['requested', 'accepted', 'completed', 'cancelled'] }).notNull(),
+  price: integer('price').notNull(),
+});
+
+export const ordersPulse = pulse(orders);
+
+// 过滤：与关系查询 where 相同的对象语法，键用列的 JS key（driverId 而非 driver_id）
+export const acceptedOrders = ordersPulse.query((ctx) => ctx.query({ status: 'accepted' }));
+
+export const bigOpenOrders = ordersPulse.query((ctx) =>
+  ctx.query({
+    price: { gte: 100, lt: 1000 },
+    status: { in: ['requested', 'accepted'] },
+    driverId: { isNotNull: true },
+  }),
+);
+
+// 运行时参数：.args() 必须在 .query() 之前，schema 必须同步校验
+export const ordersByStatus = ordersPulse
+  .args(z.object({ status: z.enum(['requested', 'accepted', 'completed', 'cancelled']) }))
+  .query((ctx) => ctx.query({ status: ctx.args.status }));
+
+// 选列与排序（按主键），可链式组合
+export const ordersByStatusSummary = ordersPulse
+  .columns({ id: true, status: true })
+  .args(z.object({ status: z.enum(['requested', 'accepted', 'completed', 'cancelled']) }))
+  .order('desc')
+  .query((ctx) => ctx.query({ status: ctx.args.status }));
+```
+
+要点：
+
+- 支持的运算符：`eq`、`ne`、`gt`、`gte`、`lt`、`lte`、`in`、`isNull`、`isNotNull`；组合用 `AND` / `OR` / `NOT`（不能与列键混在同一对象里）。
+- 每次链式调用返回新查询，一个 Pulse 表可以派生多个查询；每张表只包装一次。
+- 查询函数返回 `null` 表示匹配全表，可用于可选参数。
+- 所有查询必须在应用启动时传给 `createRuntime()`；请求里临时创建的查询运行时不认识——按请求取值请用 `.args()`，创建 collection 时传参。
+- 用了 `.columns()` 的查询，where 只能使用被选中的列。
+
+## 服务端 setup
+
+### 开启逻辑复制
+
+Pulse 通过逻辑复制读取 WAL，PostgreSQL 必须设置 `wal_level = logical`（否则 `runtime.start()` 报错；该设置需重启生效，运行时无法代改）：
+
+```sql
+SHOW wal_level;
+ALTER SYSTEM SET wal_level = logical; -- 之后重启 PostgreSQL
+```
+
+托管数据库通常在控制台设置，见各家文档。
+
+### 创建并启动运行时
+
+```ts title="server.ts"
+import { drizzle } from 'drizzle-orm/postgres';
+import { createRuntime } from 'drizzle-pulse/embedded';
+import { ordersByStatus, ordersPulse } from './queries';
+
+const runtime = createRuntime({
+  queries: { allOrders: ordersPulse, ordersByStatus },
+  databaseUrl: process.env.DATABASE_URL!,
+  sourceDb: drizzle(process.env.DATABASE_URL!),
+});
+
+await runtime.start();
+```
+
+关键选项：
+
+- `queries`：查询定义，键名会成为 `runtime.client` 与 `runtime.events` 上的名字。
+- `databaseUrl` 与 `client` 二选一：传 `client: db.$client` 可复用应用已有的连接池（池的角色需要 `REPLICATION` 属性）。
+- `sourceDb`：你自己的 Drizzle 实例，live collection 的首次读取走它，保留 RLS、`search_path` 等会话设置；重连后的重读走 `databaseUrl` 连接，不带这些会话设置。
+- `wal`：可选，`publicationName` / `slotName`，默认均为 `drizzle_pulse`。
+- `logLevel`、`telemetry`：日志级别与延迟遥测回调。
+
+启动时运行时自动创建所需数据库对象：对每张源表设置 `REPLICA IDENTITY FULL`、创建 publication（只发布 insert / update / delete，`TRUNCATE` 不产生事件）、创建**临时**复制槽（连接关闭即删除，崩溃不会残留槽堆积 WAL）。应用角色需要表所有权、数据库 `CREATE` 权限与 `REPLICATION` 属性；权限受限时可用高权限角色单独执行 `provision()`（来自 `drizzle-pulse/embedded`）作为部署步骤。新增源表后要先重新 provision 再部署。
+
+应用关闭时调用 `await runtime.stop()`：它会释放所有 collection 与事件流、关闭复制连接，但不会关闭你传入的 `sourceDb` / `client` 池。
+
+## Live collections：常驻内存的行
+
+`runtime.client.<queryName>()` 创建 live collection——相当于一个自动保持最新的 select 结果。有参数的查询把参数作为唯一入参；返回的 promise 在首批行加载完成后 resolve（运行时未 start 会 reject）。
+
+```ts
+const orders = await runtime.client.ordersByStatus({ status: 'accepted' });
+
+// 同步读取当前行（按主键排序，方向由 .order() 决定）
+const rows = orders.list();
+
+// 每次变更后回调：events + state + lsn
+const removeListener = orders.onChange(({ events, state, lsn }) => {
+  for (const event of events) {
+    // event.op 为 'insert' | 'update' | 'delete'
+    console.log(event.op, event.pk);
+  }
+});
+
+// 断线重连后整体重读：onChange 不会为断线期间的变更触发，
+// 必须用 onResync 重新广播全量
+orders.onResync(({ state }) => broadcast(state));
+
+orders.onError((error) => console.error('Live collection failed', error));
+
+// 不再需要时释放
+orders.dispose();
+```
+
+每次调用都会创建独立的新 collection：创建一次、长期持有、用完 dispose。
+
+## CDC 事件流：逐条变更
+
+`runtime.events.<queryName>()` 订阅变更数据捕获（CDC）流：不保存行、没有首次加载，只报告订阅之后的变更。参数顺序：参数（如有）、回调、可选 options；返回关闭流的函数。
+
+```ts
+const stop = runtime.events.ordersByStatus(
+  { status: 'accepted' },
+  (event, lsn) => {
+    switch (event.op) {
+      case 'insert': // 行开始匹配查询
+        console.log('entered', event.row);
+        break;
+      case 'update': // 行变更且仍匹配
+        console.log('changed', event.oldRow, '->', event.row);
+        break;
+      case 'delete': // 行不再匹配或被删除
+        console.log('left', event.oldRow);
+        break;
+    }
+  },
+  {
+    onResync: () => {/* 重新加载你基于事件构建的状态 */},
+    onError: (error) => console.error('CDC stream closed', error),
+  },
+);
+
+stop();
+```
+
+事件描述的是**查询结果**的变化：订单从 requested 变为 accepted 时，accepted 查询收到 `insert`，requested 查询收到 `delete`。事件按提交顺序到达，同一事务共享一个 `lsn`；重连后同一提交可能重复投递，有副作用的回调请用 `event.pk` + `lsn` 作幂等键。
+
+<Callout type="error" title="监听器是同步调用的">
+运行时同步调用监听器，不等待返回的 promise。async 回调必须自己 catch 错误，否则未处理的 rejection 会让 Node.js 默认终止进程。此规则适用于本页所有回调。
+</Callout>
+
+## 延伸阅读
+
+官方原文：[Overview](https://orm.drizzle.team/docs/realtime-overview)、[Queries](https://orm.drizzle.team/docs/realtime-queries)、[Server setup](https://orm.drizzle.team/docs/realtime-server-setup)、[Live collections 与 CDC](https://orm.drizzle.team/docs/realtime-live-collections)。站内相关：[连接管理](/docs/connections)、[事务](/docs/transactions)、[查询缓存](/docs/cache)（缓存是 TTL 语义，Pulse 是提交后近实时同步，两者互补）。

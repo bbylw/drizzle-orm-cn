@@ -1,0 +1,136 @@
+---
+title: 面向 AI Agent 的 Drizzle
+description: 用官方 agent setup、Drizzle Kit MCP server 与 drizzle skill 武装编码助手，以及本站的 LLM 友好文档端点。
+---
+
+Drizzle 官方为编码助手（Claude Code、Codex、Cursor、OpenCode 等）提供了三件套：**agent setup 提示词**、**Drizzle Kit MCP server**、**drizzle skill**。本页以官方 [agents](https://orm.drizzle.team/docs/agents)、[MCP](https://orm.drizzle.team/docs/drizzle-kit-mcp)、[skills](https://orm.drizzle.team/docs/drizzle-kit-skills) 文档为准；当前设置流程面向 `@rc` 包，旧的 legacy / beta 项目需要先单独升级。
+
+## 一键设置：复制提示词给你的 agent
+
+在项目里打开编码助手，粘贴官方提示词：
+
+```bash
+Set up my coding agent for Drizzle in this project. Fetch and follow the instructions at https://orm.drizzle.team/agent-setup/prompt.md
+```
+
+设置过程会：
+
+- 检查 Drizzle 包版本，用项目现有的包管理器安装缺失的 `drizzle-orm@rc` 与 `drizzle-kit@rc`；
+- 安装随 Kit 捆绑的 drizzle skill（schema、查询、迁移的工作指引）；
+- 为 agent 配置本地 MCP server 并验证连接（部分客户端需要新会话或手动批准）。
+
+设置**不会**改动应用 schema、生成迁移或触碰数据库。完成后可以先给一个只读任务验证：
+
+```bash
+Use the drizzle skill to inspect my Drizzle schema and config. Explain the
+migration workflow this project uses. Do not change files or the database.
+```
+
+## Drizzle Kit MCP server
+
+MCP server 让 agent 直接调用**你项目里安装的 Drizzle Kit**：生成迁移、检查迁移历史、从现有数据库 pull schema。它以 stdio 方式由客户端托管，不需要 HTTP 端口或单独终端。
+
+### 安装
+
+装在拥有 schema 与 `drizzle.config.*` 的包里（monorepo 中是对应 workspace 包，并从该目录启动 server）：
+
+```bash
+npm i drizzle-orm@rc
+npm i -D drizzle-kit@rc
+```
+
+### 各客户端接入
+
+```bash
+# Claude Code：写入项目级 .mcp.json，批准后可用 /mcp 查看状态
+claude mcp add --transport stdio --scope project drizzle -- npx --no-install drizzle-kit mcp
+
+# Codex CLI：写入 ~/.codex/config.toml，从 Drizzle 包目录启动 Codex
+codex mcp add drizzle -- npx --no-install drizzle-kit mcp
+
+# Grok CLI：写入 .grok/config.toml，grok mcp doctor drizzle 检查连接
+grok mcp add --scope project drizzle -- npx --no-install drizzle-kit mcp
+```
+
+Cursor：在项目根创建 `.cursor/mcp.json`（编辑器与 CLI 共用）：
+
+```json title=".cursor/mcp.json"
+{
+  "mcpServers": {
+    "drizzle": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["--no-install", "drizzle-kit", "mcp"]
+    }
+  }
+}
+```
+
+其他使用 `mcpServers` 对象的客户端，按包管理器选择命令：
+
+```json
+{
+  "mcpServers": {
+    "drizzle": {
+      "command": "pnpm",
+      "args": ["exec", "drizzle-kit", "mcp"]
+    }
+  }
+}
+```
+
+yarn 用 `"command": "yarn", "args": ["drizzle-kit", "mcp"]`；bun 用 `"command": "bun", "args": ["run", "drizzle-kit", "mcp"]`。
+
+### 使用要点
+
+- server 在**工作目录**里找 `drizzle.config.*`，相对路径也从该目录解析；用别的配置文件要明确告诉 agent 路径。push / pull 需要配置里有数据库凭据。
+- 生成迁移只写文件、不会应用到数据库；rc5 **没有** migrate MCP 工具，应用迁移仍走你现有的迁移流程。
+- 试试只读任务：「Use the Drizzle MCP server to check my migration history. Explain any conflicts or warnings without changing files or the database.」
+
+<Callout type="warn" title="权限边界">
+连接 MCP server 意味着 agent 可以写项目文件、改动配置所选的数据库。工具执行始终受客户端的权限与批准设置约束——生产库建议只给只读凭据，或要求逐条批准。
+</Callout>
+
+## Drizzle agent skills
+
+drizzle skill 覆盖迁移工作流选择、重命名与数据丢失决策、迁移冲突与 snapshot 升级。可配合 MCP server、CLI 或 SDK 使用。
+
+从项目的 Drizzle 包目录运行（rc5 起合并为单个 `drizzle` skill，会自动移除 rc4 的旧项目级 skills，自定义修改请先备份）：
+
+```bash
+npx --no-install drizzle-kit skills
+# yarn: yarn drizzle-kit skills
+# pnpm: pnpm exec drizzle-kit skills
+# bun:  bun run drizzle-kit skills
+```
+
+按提示选择 agent 与安装范围。安装需要联网运行 `skills@latest`，但 Drizzle 指引内容来自你项目里已安装的 Kit。**升级 Drizzle Kit 后重跑该命令**刷新 skill。然后让 agent 加载它：
+
+```bash
+Use the drizzle skill. In src/db/schema.ts, rename users.full_name
+to users.display_name and generate a migration. Show me the SQL
+before applying anything to the database.
+```
+
+skill 会引导 agent 做出保留数据的重命名决策；生成迁移不等于应用迁移。
+
+## 本站的 LLM 友好端点
+
+本站由 Fumadocs 生成纯文本文档端点，方便 agent 与 RAG 直接消费，无需解析 HTML：
+
+- `/llms.txt`：全站文档索引（标题 + 链接 + 描述）；
+- `/llms-full.txt`：全部文档正文合并的单一文件；
+- `/docs/<slug>.md`：单页 Markdown，例如 `/docs/cache.md`、`/docs/read-replicas.md`。
+
+```bash
+# 让 agent 先读索引再按需取单页
+curl https://本站域名/llms.txt
+curl https://本站域名/docs/queries.md
+```
+
+给 agent 布置本站相关任务时，可以直接提示它优先抓取这些端点获取上下文。
+
+## 延伸阅读
+
+- 官方：[Set up your AI agent](https://orm.drizzle.team/docs/agents)、[Drizzle Kit MCP server](https://orm.drizzle.team/docs/drizzle-kit-mcp)、[Drizzle agent skills](https://orm.drizzle.team/docs/drizzle-kit-skills)
+- 站内：[Drizzle Kit](/docs/drizzle-kit)、[迁移](/docs/migrations)、[zod 校验集成](/docs/zod)

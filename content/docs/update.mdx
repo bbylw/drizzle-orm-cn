@@ -1,0 +1,146 @@
+---
+title: SQL Update
+description: db.update() 完整参考：set 对象、undefined 与 null 的区别、sql 表达式自增、where 过滤、returning 与 PostgreSQL 的 update … from 多表更新。
+---
+
+本页示例沿用[快速开始](/docs/quickstart)中的 `db` 实例与 `users`、`cities` 表。update 的基本形态是 `db.update(表).set(值).where(条件)`。
+
+## set：更新哪些列
+
+`set()` 的键必须是 schema 中定义的列，值自动参数化：
+
+```ts
+import { eq } from 'drizzle-orm';
+import { db } from './db';
+import { users } from './db/schema';
+
+await db.update(users).set({ name: 'Mr. Dan' }).where(eq(users.name, 'Dan'));
+// update "users" set "name" = $1 where "name" = $2
+```
+
+两个容易踩坑的取值规则：
+
+| 值 | 行为 |
+| --- | --- |
+| `undefined` | 该列被**忽略**，不出现在 SET 中（适合"传了才改"的补丁式更新） |
+| `null` | 该列被显式设为 `NULL`（列不可为空时报错） |
+
+```ts
+// PATCH 场景：body 里没传的字段保持原值
+await db.update(users).set({ name: body.name, bio: body.bio }).where(eq(users.id, id));
+```
+
+## sql 表达式：自增与数据库函数
+
+值的位置可以放任何 SQL 表达式，自增在数据库端原子完成，避免"读-改-写"竞态：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.update(users).set({ age: sql`${users.age} + 1` }).where(eq(users.id, 1));
+
+await db.update(users).set({ updatedAt: sql`now()` }).where(eq(users.id, 1));
+```
+
+## where 与运算符
+
+`where()` 接收[运算符](/docs/operators)表达式，可组合 `and`/`or`/`inArray` 等：
+
+```ts
+import { and, eq, lt } from 'drizzle-orm';
+
+await db.update(users)
+  .set({ verified: false })
+  .where(and(eq(users.role, 'member'), lt(users.lastLoginAt, new Date('2025-01-01'))));
+```
+
+<Callout type="error" title="不写 where 会更新全表">
+`db.update(users).set(...)` 不带 `where()` 时更新表中**所有行**。执行前确认条件存在，必要时在[事务](/docs/transactions)中先 select 校验。
+</Callout>
+
+## returning：拿回更新后的行
+
+<Tabs items={['PostgreSQL', 'SQLite', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```ts
+// 整行返回
+await db.update(users).set({ name: 'Mr. Dan' }).where(eq(users.name, 'Dan')).returning();
+
+// 部分返回
+await db.update(users)
+  .set({ name: 'Mr. Dan' })
+  .where(eq(users.name, 'Dan'))
+  .returning({ id: users.id, name: users.name });
+```
+
+</Tab>
+<Tab value="SQLite">
+
+SQLite 3.35+ 支持 `RETURNING`，用法与 PG 相同：
+
+```ts
+await db.update(users).set({ name: 'Mr. Dan' }).where(eq(users.name, 'Dan')).returning();
+```
+
+</Tab>
+<Tab value="MySQL">
+
+MySQL 的 `UPDATE` 没有 `RETURNING`，update 构建器也没有 `$returningId()`（那是 insert 专用）。需要更新后的数据时，在同一事务里再 select 一次。
+
+</Tab>
+</Tabs>
+
+## 多表更新：update … from（PostgreSQL）
+
+PG 支持 `UPDATE … FROM`，用另一张表的列为本表赋值，`.from()` 中也可以使用 `alias()`：
+
+```ts
+import { and, eq } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
+import { cities } from './db/schema';
+
+await db.update(users)
+  .set({ cityId: cities.id })
+  .from(cities)
+  .where(and(eq(cities.name, 'Seattle'), eq(users.name, 'John')));
+// update "users" set "city_id" = "cities"."id" from "cities" where ...
+
+// 表别名
+const c = alias(cities, 'c');
+await db.update(users).set({ cityId: c.id }).from(c).where(eq(c.name, 'Seattle'));
+```
+
+`.returning()` 还可以返回 join 进来的表的列。
+
+<Callout type="info" title="MySQL / SQLite 的替代写法">
+`.from()` 是 PostgreSQL 专属语法。MySQL/SQLite 场景下，通用做法是用子查询圈定行、用 `sql` 表达式取值：`where(inArray(users.id, subquery))` 配合 ``set({ col: sql`(select ...)` })``；复杂的多表 UPDATE 也可用 ``db.execute(sql`...`)`` 写原生 SQL。
+</Callout>
+
+## WITH update
+
+与 select 一样，update 也能挂在 CTE 后面：
+
+```ts
+import { eq, inArray } from 'drizzle-orm';
+
+const target = db.$with('target').as(
+  db.select({ id: users.id }).from(users).where(eq(users.verified, false)),
+);
+
+await db.with(target)
+  .update(users)
+  .set({ role: 'guest' })
+  .where(inArray(users.id, db.select({ id: target.id }).from(target)));
+```
+
+## 常见坑
+
+- `set({})` 空对象会报错；动态构造 set 时先过滤 `undefined` 再判空。
+- 自增务必用 `` sql`${col} + 1` ``，不要先查询再在 JS 里加——并发下会丢更新。
+- `where()` 只能调用一次，分步拼装用 `.$dynamic()`，见 [SQL Select](/docs/select)。
+
+<Cards>
+  <Card title="SQL Insert" href="/docs/insert" description="upsert：冲突时转为更新的另一条路径。" />
+  <Card title="运算符" href="/docs/operators" description="where 条件速查表。" />
+</Cards>

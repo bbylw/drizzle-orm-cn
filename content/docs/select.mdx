@@ -1,0 +1,180 @@
+---
+title: SQL Select
+description: db.select() 完整参考：全列与部分选择、表达式列、distinct、子查询与 CTE、过滤排序分页、聚合计数与动态查询构建。
+---
+
+本页示例沿用[快速开始](/docs/quickstart)中的 `db` 实例与 `users`、`posts`、`orders` 等表。查询总览与两种查询风格的取舍见[查询构建器](/docs/queries)，本页聚焦 `db.select()` 的完整 API。
+
+## 全列与部分选择
+
+```ts
+import { db } from './db';
+import { users } from './db/schema';
+
+// 全列：返回 users 的所有字段
+const all = await db.select().from(users);
+
+// 部分选择：只查指定列，返回类型随之收窄为 { id: number; name: string }[]
+const partial = await db.select({ id: users.id, name: users.name }).from(users);
+```
+
+Drizzle 始终生成显式列名列表，**不会生成 `select *`**。这带来两个好处：表结构变更后结果类型仍然准确；驱动返回的字段映射稳定，不受列顺序影响。
+
+## 表达式列与 getColumns
+
+`select()` 的对象值可以是任意 SQL 表达式。用 `sql<T>` 泛型标注结果类型（仅类型提示，不做运行时转换），需要真正转换时用 `.mapWith()`：
+
+```ts
+import { getColumns, sql } from 'drizzle-orm';
+
+const rows = await db
+  .select({
+    ...getColumns(users), // 展开 users 全部列（v1 中替代已废弃的 getTableColumns）
+    lowerName: sql<string>`lower(${users.name})`,
+    ageNextYear: sql<number>`${users.age} + 1`.mapWith(Number),
+  })
+  .from(users);
+```
+
+`getColumns()` 返回列对象映射，可配合解构剔除个别列：
+
+```ts
+const { password, ...rest } = getColumns(users);
+const safeUsers = await db.select(rest).from(users);
+```
+
+## Distinct
+
+```ts
+await db.selectDistinct({ age: users.age }).from(users);
+```
+
+<Tabs items={['PostgreSQL', 'MySQL / SQLite']}>
+<Tab value="PostgreSQL">
+
+PG 额外支持 `selectDistinctOn`，按指定列去重，通常配合 `orderBy` 决定保留哪一行：
+
+```ts
+// 每个 id 只保留一行，按 id 排序
+await db.selectDistinctOn([users.id]).from(users).orderBy(users.id);
+// select distinct on ("id") ... from "users" order by "id"
+```
+
+</Tab>
+<Tab value="MySQL / SQLite">
+
+MySQL 与 SQLite 只有 `selectDistinct`，没有 `DISTINCT ON` 语法。等价效果可用窗口函数或分组子查询实现。
+
+</Tab>
+</Tabs>
+
+## 过滤、排序与分页
+
+```ts
+import { and, asc, desc, eq, gt } from 'drizzle-orm';
+
+await db
+  .select()
+  .from(users)
+  .where(and(eq(users.role, 'member'), gt(users.age, 18)))
+  .orderBy(desc(users.createdAt), asc(users.id))
+  .limit(20)
+  .offset(40);
+```
+
+`where()` 接收[运算符](/docs/operators)表达式。条件可选时传 `undefined`，`and()`/`or()` 会自动忽略它：
+
+```ts
+const filters = [
+  name ? eq(users.name, name) : undefined,
+  minAge ? gt(users.age, minAge) : undefined,
+];
+await db.select().from(users).where(and(...filters));
+```
+
+<Callout type="warn" title="where 只能调用一次">
+默认模式下 `.where()`、`.limit()` 等方法只能调用一次（与 SQL 语义一致），重复调用会报类型错误。需要分步拼装查询时先调用 `.$dynamic()`，见下文。
+</Callout>
+
+## 子查询与 CTE
+
+任何 select 加上 `.as('别名')` 就是子查询，可以出现在表能出现的任何位置：
+
+```ts
+const sq = db.select().from(users).where(eq(users.id, 42)).as('sq');
+await db.select().from(sq);
+// select ... from (select ... from "users" where "id" = $1) "sq"
+```
+
+`db.$with()` 定义 CTE，再用 `db.with()` 引用，适合拆复杂查询：
+
+```ts
+const recentUsers = db.$with('recent_users').as(
+  db.select().from(users).where(gt(users.createdAt, new Date('2026-01-01'))),
+);
+await db.with(recentUsers).select().from(recentUsers);
+```
+
+<Callout type="warn" title="CTE 中的表达式列必须命名">
+CTE 的 select 若包含 `sql` 表达式列，必须加 `.as('别名')`，否则会得到 `DrizzleTypeError`。正确写法：``sql`count(*)`.as('value')``。
+</Callout>
+
+## 聚合与计数
+
+```ts
+import { count, eq, gt, sql } from 'drizzle-orm';
+
+const stats = await db
+  .select({ role: users.role, total: count() })
+  .from(users)
+  .groupBy(users.role)
+  .having(({ total }) => gt(total, 1)); // having 支持回调引用 select 中的别名
+```
+
+只要行数时用 `db.$count()`，直接返回 `number`，也可以作为子查询字段嵌入 select：
+
+```ts
+const n = await db.$count(users, eq(users.name, 'Dan'));
+
+await db.select({ id: users.id, ordersCount: db.$count(orders, eq(orders.userId, users.id)) }).from(users);
+```
+
+<Tabs items={['PostgreSQL', 'MySQL / SQLite']}>
+<Tab value="PostgreSQL">
+
+PG 的 `count()` 返回 bigint，驱动映射为 **string**。要拿 number，用 ``sql<number>`count(*)`.mapWith(Number)`` 或 ``sql`cast(count(*) as int)` ``。`avg`/`sum` 同样默认映射为 string，按需 `mapWith`。
+
+</Tab>
+<Tab value="MySQL / SQLite">
+
+MySQL 与 SQLite 的 `count()` 直接映射为 number。聚合辅助函数 `count`/`countDistinct`/`avg`/`sum`/`max`/`min` 各方言均可从 `drizzle-orm` 导入。
+
+</Tab>
+</Tabs>
+
+## 动态查询构建：$dynamic
+
+把查询交给共享函数逐步增强时，先调用 `.$dynamic()` 解除"方法只能调用一次"的限制：
+
+```ts
+import { type PgSelect } from 'drizzle-orm/pg-core';
+
+function withPagination<T extends PgSelect>(qb: T, page: number, pageSize = 10) {
+  return qb.limit(pageSize).offset((page - 1) * pageSize);
+}
+
+let query = db.select().from(users).$dynamic();
+query = withPagination(query, 2);
+const rows = await query;
+```
+
+`PgSelect`、`PgInsert`、`PgUpdate`、`PgDelete` 等类型专为动态模式设计（MySQL/SQLite 有对应的 `MySqlSelect`、`SQLiteSelect` 等）。详见官方 [Dynamic query building](https://orm.drizzle.team/docs/dynamic-query-building)。
+
+## 结果类型
+
+`typeof users.$inferSelect` 是整行结果的类型；部分选择的类型由 select 对象自动推导，无需手写。需要复用某条查询的结果类型时用 `Awaited<typeof query>`。
+
+<Cards>
+  <Card title="运算符" href="/docs/operators" description="eq、inArray、exists 等全部过滤运算符速查。" />
+  <Card title="Joins" href="/docs/joins" description="多表 join 与嵌套结果类型。" />
+</Cards>

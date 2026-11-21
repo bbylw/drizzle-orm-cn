@@ -1,0 +1,141 @@
+---
+title: 生成列
+description: 用 generatedAlwaysAs 声明由数据库计算的生成列：PostgreSQL 仅 STORED，MySQL 与 SQLite 支持 virtual/stored，含支持矩阵、示例与限制。
+---
+
+生成列（generated column）的值由数据库根据表达式自动计算，插入或更新行时维护，应用代码不能直接写入。Drizzle 在任意列构造函数上提供 `.generatedAlwaysAs()`，对应 SQL 的 `GENERATED ALWAYS AS (...)`。
+
+## 支持矩阵
+
+| 数据库 | 模式 | 默认模式 | 说明 |
+| --- | --- | --- | --- |
+| PostgreSQL（12+） | 仅 `stored` | `stored` | 写入时计算并落盘，可建索引 |
+| MySQL（5.7+） | `virtual` / `stored` | `virtual` | virtual 读取时计算，stored 落盘 |
+| SQLite（3.31+） | `virtual` / `stored` | `virtual` | 生成列不能作主键 |
+
+`stored` 占存储但查询快、可索引；`virtual` 不占存储、每次读取时计算。MySQL 的 InnoDB 支持在 virtual 列上建二级索引。
+
+## 基本用法
+
+表达式有两种写法：直接传 `sql` 模板（常量表达式），或传回调 `(): SQL => sql` 引用本表其他列（需要引用列时必须用回调）。
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+```ts
+import { SQL, sql } from 'drizzle-orm';
+import { pgTable, text } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  firstName: text('first_name'),
+  lastName: text('last_name'),
+  // PG 只支持 STORED，无需传 mode
+  fullName: text('full_name').generatedAlwaysAs(
+    (): SQL => sql`${users.firstName} || ' ' || ${users.lastName}`,
+  ),
+});
+```
+
+```sql
+"full_name" text GENERATED ALWAYS AS ("first_name" || ' ' || "last_name") STORED
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```ts
+import { SQL, sql } from 'drizzle-orm';
+import { decimal, int, mysqlTable } from 'drizzle-orm/mysql-core';
+
+export const orderItems = mysqlTable('order_items', {
+  price: decimal('price', { precision: 10, scale: 2 }).notNull(),
+  quantity: int('quantity').notNull(),
+  // virtual：读取时计算（默认）
+  total: decimal('total', { precision: 12, scale: 2 }).generatedAlwaysAs(
+    (): SQL => sql`${orderItems.price} * ${orderItems.quantity}`,
+    { mode: 'virtual' },
+  ),
+});
+```
+
+</Tab>
+<Tab value="SQLite">
+
+```ts
+import { SQL, sql } from 'drizzle-orm';
+import { integer, sqliteTable } from 'drizzle-orm/sqlite-core';
+
+export const rects = sqliteTable('rects', {
+  width: integer('width').notNull(),
+  height: integer('height').notNull(),
+  // stored：写入时计算并落盘
+  area: integer('area').generatedAlwaysAs(
+    (): SQL => sql`${rects.width} * ${rects.height}`,
+    { mode: 'stored' },
+  ),
+});
+```
+
+</Tab>
+</Tabs>
+
+## PostgreSQL 的限制
+
+官方文档列出的 PG 生成列限制：
+
+- 不能再指定默认值（`.default()` 等）。
+- 表达式不能引用其他生成列，也不能包含子查询。
+- 不能直接用于主键、外键或唯一约束。
+- 修改表达式属于 schema 变更，需要走迁移（drizzle-kit 会重建该列）。
+
+此外 PG 要求表达式是 immutable 的，`to_tsvector('english', ...)` 这类显式指定配置的调用才满足要求。
+
+## 示例：全文检索列
+
+生成列最常见的用途之一是维护 `tsvector` 全文检索列并建 GIN 索引（`tsvector` 用 [customType](/docs/custom-types) 映射）：
+
+```ts title="src/db/schema.ts"
+import { SQL, sql } from 'drizzle-orm';
+import { customType, index, integer, pgTable, text } from 'drizzle-orm/pg-core';
+
+const tsVector = customType<{ data: string }>({
+  dataType() {
+    return 'tsvector';
+  },
+});
+
+export const articles = pgTable(
+  'articles',
+  {
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    content: text('content'),
+    contentSearch: tsVector('content_search').generatedAlwaysAs(
+      (): SQL => sql`to_tsvector('english', ${articles.content})`,
+    ),
+  },
+  (t) => [index('idx_content_search').using('gin', t.contentSearch)],
+);
+```
+
+查询时用 `sql` 操作符匹配：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+const rows = await db
+  .select()
+  .from(articles)
+  .where(sql`${articles.contentSearch} @@ to_tsquery('english', 'drizzle')`);
+```
+
+<Callout type="info" title="生成列 vs $defaultFn">
+`.$defaultFn()` 在应用端插入时计算一次，值写入普通列，之后不随其他列变化；`generatedAlwaysAs()` 由数据库在每次插入/更新时重算，始终与源列一致。需要「随源数据自动更新」的派生值用生成列，只需要「插入时给个初值」用默认值或 `$defaultFn`。
+</Callout>
+
+## 接下来
+
+<Cards>
+  <Card title="索引与约束" href="/docs/indexes-constraints" description="在生成列上建索引及各方言索引选项。" />
+  <Card title="自定义类型" href="/docs/custom-types" description="映射 tsvector 等 Drizzle 未内置的类型。" />
+  <Card title="PostgreSQL 列类型" href="/docs/column-types-postgres" description="pg-core 全部列构造函数速查。" />
+</Cards>

@@ -1,0 +1,132 @@
+---
+title: 序列（Sequences）
+description: 用 pgSequence 声明 PostgreSQL 序列，控制起始值、步长与循环，并在列默认值中通过 nextval 引用。
+---
+
+序列（sequence）是 PostgreSQL 中独立于表的自增计数器对象。`serial` / `identity` 列背后其实都挂着一个隐式序列；当你需要**跨表共享编号**、**自定义步长或缓存**、**预取号段**时，就该显式声明序列。Drizzle 通过 `drizzle-orm/pg-core` 的 `pgSequence` 支持这一能力，MySQL 与 SQLite 没有独立的序列对象。
+
+## 声明序列
+
+```ts title="src/db/schema.ts"
+import { pgSequence } from 'drizzle-orm/pg-core';
+
+// 全部选项都有默认值，可以只写需要的部分
+export const orderNumberSeq = pgSequence('order_number_seq', {
+  startWith: 100,   // 起始值
+  increment: 2,     // 步长，可为负数（递减序列）
+  minValue: 100,    // 最小值
+  maxValue: 10000,  // 最大值
+  cache: 10,        // 每个会话预缓存的号码个数
+  cycle: true,      // 到达边界后是否回绕
+});
+```
+
+生成的 SQL：
+
+```sql
+CREATE SEQUENCE "order_number_seq"
+  INCREMENT BY 2 MINVALUE 100 MAXVALUE 10000
+  START WITH 100 CACHE 10 CYCLE;
+```
+
+各选项的含义与陷阱：
+
+| 选项 | 说明 | 注意事项 |
+| --- | --- | --- |
+| `startWith` | 序列的第一个值 | 必须落在 `minValue` 与 `maxValue` 之间 |
+| `increment` | 步长 | 负数表示递减，此时默认边界方向反转 |
+| `minValue` / `maxValue` | 取值边界 | 不设置 `cycle` 时越界会报错 |
+| `cache` | 会话级预分配数量 | 大于 1 时号码可能**不连续**（会话断开即丢弃缓存） |
+| `cycle` | 到边界后回绕 | 回绕后可能产生重复值，不要用于唯一键 |
+
+<Callout type="warn" title="序列不保证连续">
+序列值在事务回滚后**不会归还**，`cache > 1` 时还会跳号。序列适合做"单调递增的业务编号"，不适合做"无空洞的发票号"这类严格连续的场景。
+</Callout>
+
+## 在列默认值中引用序列
+
+`pgSequence` 只负责创建序列对象，列与序列的关联要靠 `nextval` 默认值自己接上：
+
+```ts title="src/db/schema.ts"
+import { sql } from 'drizzle-orm';
+import { bigint, pgSequence, pgTable, text } from 'drizzle-orm/pg-core';
+
+export const orderNumberSeq = pgSequence('order_number_seq', { startWith: 1000 });
+
+export const orders = pgTable('orders', {
+  id: bigint('id', { mode: 'number' }).primaryKey(),
+  // 插入时自动取号；bigint 避免号码超出 number 范围
+  orderNo: bigint('order_no', { mode: 'number' })
+    .notNull()
+    .default(sql`nextval('order_number_seq')`),
+  memo: text('memo'),
+});
+```
+
+插入时省略 `orderNo` 即可自动取号，也可以显式调用取号函数：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+// 手动取一个号（例如先取号再写多张关联表）
+const [{ next }] = await db.execute<{ next: number }>(
+  sql`select nextval('order_number_seq') as next`,
+);
+
+await db.insert(orders).values({ id: 1, orderNo: next });
+```
+
+多张表可以共用同一个序列，这正是显式序列相对 `serial` 的核心优势——例如订单表与退款表共享一个全局流水号。
+
+## 在自定义 schema 中声明
+
+序列可以归属于某个 schema，用法与表一致（详见 [Schemas](/docs/schemas)）：
+
+```ts
+import { pgSchema } from 'drizzle-orm/pg-core';
+
+export const billing = pgSchema('billing');
+export const invoiceSeq = billing.sequence('invoice_seq', { startWith: 1 });
+```
+
+此时 `nextval` 需要带上 schema 限定名，否则依赖连接的 `search_path`：
+
+```ts
+.default(sql`nextval('billing.invoice_seq')`)
+```
+
+## identity / serial / sequence 怎么选
+
+| 方案 | 写法 | 适用场景 |
+| --- | --- | --- |
+| `serial` / `bigserial` | `serial('id').primaryKey()` | 单表自增主键，最省事 |
+| identity 列 | `integer('id').generatedAlwaysAsIdentity()` | SQL 标准做法，序列随列生命周期管理，可带序列选项 |
+| 显式 `pgSequence` | `pgSequence(...)` + `nextval` 默认值 | 跨表共享、独立管理、需要预取号 |
+
+identity 列也支持序列参数：
+
+```ts
+import { integer, pgTable } from 'drizzle-orm/pg-core';
+
+export const tickets = pgTable('tickets', {
+  id: integer('id')
+    .primaryKey()
+    .generatedAlwaysAsIdentity({ startWith: 1000, increment: 1, cache: 20 }),
+});
+```
+
+经验法则：默认用 identity（或存量的 `serial`）；只有当编号需要**脱离单表**存在时才引入 `pgSequence`。`serial` 的隐式序列会随表删除而删除，而显式序列是独立对象，删表不会删序列。
+
+## 迁移行为与注意事项
+
+- `drizzle-kit generate` 会为新增序列生成 `CREATE SEQUENCE`，修改选项生成 `ALTER SEQUENCE`，删除导出生成 `DROP SEQUENCE`。
+- **`ALTER SEQUENCE` 不会重置当前计数**。改了 `startWith` 只影响 `RESTART` 之后的行为；需要立即重置时在自定义迁移里追加 `ALTER SEQUENCE ... RESTART WITH ...`（参见 [迁移](/docs/migrations)）。
+- 列默认值里的 `nextval('...')` 是字符串字面量，`drizzle-kit` 不会追踪它与序列对象的依赖。删除序列前先确认没有列默认值仍在引用，否则插入会运行时报错。
+- 用 `drizzle-kit push` 时同样注意：push 对序列选项变更的处理较保守，涉及 `cycle`、边界的修改建议走 generate + 人工审查。
+- `introspect`（pull）能把数据库里已有的序列拉回为 `pgSequence` 声明，但 `nextval` 默认值会以 `sql` 原样保留。
+
+<Cards>
+  <Card title="Schemas" href="/docs/schemas" description="把序列、表、枚举组织到独立的 PostgreSQL schema 中。" />
+  <Card title="索引与约束" href="/docs/indexes-constraints" description="主键、唯一约束与索引的声明方式。" />
+  <Card title="迁移" href="/docs/migrations" description="generate / migrate / push 的工作流与自定义迁移。" />
+</Cards>

@@ -1,0 +1,130 @@
+---
+title: 动态查询构建
+description: 用 $dynamic() 解除查询构建器方法只能调用一次的限制，编写可复用的分页、过滤与 join 增强函数。
+---
+
+Drizzle 的查询构建器默认贴近 SQL 语义：一条 `select` 只有一个 `where`，所以大多数方法**只能调用一次**。这适合一次性写完整条查询，但当你想把查询传给共享函数逐步增强时就成了障碍。`.$dynamic()` 就是为此而生。本页示例假设已有 `db` 实例与 `users`、`posts` 等表。
+
+## 默认限制
+
+```ts
+const query = db
+  .select()
+  .from(users)
+  .where(eq(users.id, 1))
+  .where(eq(users.name, 'John')); // ❌ 类型错误：where() 只能调用一次
+```
+
+Drizzle 不会把多次 `.where()` 合并成一个条件——直接禁止，避免歧义。
+
+## 开启动态模式
+
+调用 `.$dynamic()` 后，方法可以重复调用（后写的覆盖/追加，视方法而定）：
+
+```ts
+function withPagination<T extends PgSelect>(
+  qb: T,
+  page: number = 1,
+  pageSize: number = 10,
+) {
+  return qb.limit(pageSize).offset((page - 1) * pageSize);
+}
+
+const query = db.select().from(users).where(eq(users.id, 1));
+withPagination(query, 1); // ❌ 类型错误：不是动态模式
+
+const dynamicQuery = query.$dynamic();
+withPagination(dynamicQuery, 1); // ✅ OK
+```
+
+## 泛型保留结果类型
+
+`withPagination` 使用泛型 `T extends PgSelect`，返回类型与传入类型一致。增强函数甚至可以改变结果形状，例如追加 join：
+
+```ts
+import type { PgSelect } from 'drizzle-orm/pg-core';
+
+function withFriends<T extends PgSelect>(qb: T) {
+  return qb.leftJoin(friends, eq(friends.userId, users.id));
+}
+
+let query = db.select().from(users).where(eq(users.id, 1)).$dynamic();
+query = withFriends(query); // 返回类型包含 join 后的字段
+```
+
+## 可用的泛型约束类型
+
+| 查询 | 类型 |
+| --- | --- |
+| Select | `PgSelect` / `PgSelectQueryBuilder` |
+| Insert | `PgInsert` |
+| Update | `PgUpdate` |
+| Delete | `PgDelete` |
+
+MySQL / SQLite 对应 `MySqlSelect`、`SQLiteSelect` 等同名系列。`...QueryBuilder` 类型用于独立查询构建器（`new QueryBuilder()`，不绑定 db）；db 上的构建器是其子类，两者都可用：
+
+```ts
+import { QueryBuilder } from 'drizzle-orm/pg-core';
+
+function withFriends<T extends PgSelectQueryBuilder>(qb: T) {
+  return qb.leftJoin(friends, eq(friends.userId, users.id));
+}
+
+const qb = new QueryBuilder();
+let query = qb.select().from(users).where(eq(users.id, 1)).$dynamic();
+query = withFriends(query);
+```
+
+<Callout type="info" title="类型只能用于动态模式">
+`PgSelect` 等类型专为动态构建设计，只有 `$dynamic()` 之后的构建器才能赋给它们。
+</Callout>
+
+## 实战：可选过滤条件
+
+典型的列表接口：过滤参数都是可选的。动态模式让「有则追加」变得自然：
+
+```ts
+import { and, eq, ilike, type SQL } from 'drizzle-orm';
+
+function searchUsers(filters: { name?: string; verified?: boolean }) {
+  let query = db.select().from(users).$dynamic();
+
+  const conditions: SQL[] = [];
+  if (filters.name) conditions.push(ilike(users.name, `%${filters.name}%`));
+  if (filters.verified !== undefined) conditions.push(eq(users.verified, filters.verified));
+
+  if (conditions.length > 0) query = query.where(and(...conditions));
+  return query;
+}
+
+const result = await searchUsers({ name: 'dan' });
+```
+
+<Callout type="warn" title="不要拼接用户输入">
+`ilike` 等运算符会把值参数化，安全；但不要把用户输入拼进 `sql.raw()`。详见 [sql`` 模板运算符](/docs/sql-operator)。
+</Callout>
+
+另一种不改查询形状的做法：先把条件收集到数组，最后一次性 `.where(and(...))`——无需动态模式，适合条件都在同一处组装的场景。动态模式的价值在于**跨函数、分步骤**地增强查询。
+
+## 实战：可组合的排序与分页
+
+```ts
+function withOrder<T extends PgSelect>(qb: T, sort?: 'newest' | 'oldest') {
+  if (sort === 'newest') return qb.orderBy(desc(users.id));
+  if (sort === 'oldest') return qb.orderBy(asc(users.id));
+  return qb;
+}
+
+const list = await withOrder(
+  withPagination(db.select().from(users).$dynamic(), 2, 20),
+  'newest',
+);
+```
+
+## 小结
+
+- 一次性查询：直接用构建器，享受「方法只能调一次」带来的正确性保障。
+- 共享增强函数：参数约束为 `T extends PgSelect` 等类型，调用方先 `.$dynamic()`。
+- 可选条件：动态模式 + 条件数组，或集中组装 `and(...conditions)`。
+
+延伸阅读：[Select 查询](/docs/select)、[条件运算符](/docs/operators)、[sql`` 模板运算符](/docs/sql-operator)。

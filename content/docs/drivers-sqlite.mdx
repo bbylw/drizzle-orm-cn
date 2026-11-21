@@ -1,0 +1,260 @@
+---
+title: SQLite 驱动
+description: better-sqlite3、libSQL/Turso、Cloudflare D1 与 Durable Objects、Bun、Node、Expo、OP-SQLite、SQLite Cloud 全矩阵。
+---
+
+SQLite 系驱动覆盖本地文件、嵌入式同步、边缘托管与移动端。方言统一用 `drizzle-orm/sqlite-core` 定义 schema，差异只在客户端与初始化方式。
+
+<Callout type="info" title="版本说明">
+标注 **v1 RC** 的驱动需要 `drizzle-orm@rc`；未标注的在 0.x 稳定版与 v1 中均可用。Turso 新一代 `@tursodatabase/*` 驱动均为 v1 RC 引入。
+</Callout>
+
+## better-sqlite3
+
+Node.js 本地文件数据库的默认选择，同步 API、性能极好；原生模块需要编译环境，不适合边缘运行时。
+
+```ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+
+const sqlite = new Database('sqlite.db');
+export const db = drizzle({ client: sqlite, schema });
+```
+
+## libSQL / Turso Cloud
+
+`@libsql/client` 是 Turso 的客户端，`drizzle-orm/libsql` 适配。云端连接：
+
+```ts
+import { createClient } from '@libsql/client';
+import { drizzle } from 'drizzle-orm/libsql';
+
+const client = createClient({
+  url: process.env.DATABASE_URL!, // libsql://xxx.turso.io
+  authToken: process.env.DATABASE_AUTH_TOKEN,
+});
+
+export const db = drizzle({ client, schema });
+```
+
+边缘运行时（Workers 等）改用 web 入口，避免 Node 依赖：
+
+```ts
+import { createClient } from '@libsql/client/web';
+import { drizzle } from 'drizzle-orm/libsql/web';
+```
+
+**embedded replica**（本地副本 + 远端同步）是 libSQL 客户端能力：本地读、远端写，读延迟极低：
+
+```ts
+const client = createClient({
+  url: 'file:local.db', // 本地副本文件
+  syncUrl: 'libsql://xxx.turso.io',
+  authToken: process.env.DATABASE_AUTH_TOKEN,
+  syncInterval: 60, // 秒，自动同步间隔
+});
+```
+
+## Turso Database / serverless / sync（v1 RC）
+
+Turso 新一代引擎与驱动家族，官方文档分为三页：
+
+<Tabs items={['Database（本地）', 'Serverless（云）', 'Sync（离线同步）']}>
+<Tab value="Database（本地）">
+
+```ts
+import { Database } from '@tursodatabase/database';
+import { drizzle } from 'drizzle-orm/tursodatabase/database';
+
+const client = new Database('sqlite.db');
+const db = drizzle({ client, schema });
+```
+
+</Tab>
+<Tab value="Serverless（云）">
+
+```ts
+import { connect } from '@tursodatabase/serverless';
+import { drizzle } from 'drizzle-orm/tursodatabase-serverless';
+
+const client = connect({
+  url: process.env.TURSO_URL!,
+  authToken: process.env.TURSO_TOKEN,
+});
+const db = drizzle({ client, schema });
+```
+
+</Tab>
+<Tab value="Sync（离线同步）">
+
+```ts
+import { connect } from '@tursodatabase/sync';
+import { drizzle } from 'drizzle-orm/tursodatabase-sync';
+
+const client = await connect({
+  path: 'local.db', // 本地文件前缀
+  url: 'https://xxx.turso.io',
+  authToken: '...',
+  clientName: 'my-app',
+});
+const db = drizzle({ client, schema });
+```
+
+</Tab>
+</Tabs>
+
+## Cloudflare D1
+
+Workers 原生托管 SQLite，通过绑定访问，无需连接串：
+
+```ts title="src/index.ts"
+import { drizzle } from 'drizzle-orm/d1';
+
+export interface Env {
+  DB: D1Database; // wrangler 中配置的 binding
+}
+
+export default {
+  async fetch(request: Request, env: Env) {
+    const db = drizzle(env.DB, { schema });
+    const result = await db.select().from(users).all();
+    return Response.json(result);
+  },
+};
+```
+
+<Callout type="warn" title="D1 的 batch 与事务限制">
+D1 **不支持交互式事务**。多条语句要原子执行请用 `db.batch([...])`，一次往返提交；Drizzle 的 D1 事务基于 batch 实现，回调中的语句攒齐后才执行，无法根据中间查询结果动态回滚。每次请求内创建 `drizzle(env.DB)`，不要跨请求缓存。
+</Callout>
+
+## Cloudflare Durable Objects SQLite
+
+每个 DO 实例自带 SQLite 存储，适合有状态的实时应用：
+
+```ts
+import { drizzle } from 'drizzle-orm/durable-sqlite';
+import { migrate } from 'drizzle-orm/durable-sqlite/migrator';
+import { DurableObject } from 'cloudflare:workers';
+import migrations from '../drizzle/migrations';
+
+export class MyDurableObject extends DurableObject {
+  db: ReturnType<typeof drizzle>;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.db = drizzle(ctx.storage, { schema });
+    // 接受查询前先完成迁移
+    ctx.blockConcurrencyWhile(async () => {
+      migrate(this.db, migrations);
+    });
+  }
+}
+```
+
+坑点：Worker 与 DO 之间每次方法调用都是一次往返。**把多步数据库操作打包进一个 DO 方法**，不要逐条远程调用查询。wrangler 需声明 `new_sqlite_classes` 迁移。
+
+## Bun SQLite
+
+Bun 内置，零依赖，同步 API：
+
+```ts
+import { Database } from 'bun:sqlite';
+import { drizzle } from 'drizzle-orm/bun-sqlite';
+
+const sqlite = new Database('sqlite.db');
+export const db = drizzle({ client: sqlite, schema });
+```
+
+## Node SQLite（v1 RC）
+
+Node.js 22.5+ 内置 `node:sqlite`，无需原生编译（早期版本需 `--experimental-sqlite` 标志）：
+
+```ts
+import { DatabaseSync } from 'node:sqlite';
+import { drizzle } from 'drizzle-orm/node-sqlite';
+
+const sqlite = new DatabaseSync('sqlite.db');
+export const db = drizzle({ client: sqlite, schema });
+```
+
+适合不想引入 better-sqlite3 原生依赖的新 Node 项目，简写为 `drizzle('sqlite.db')`。
+
+## Expo SQLite
+
+React Native / Expo 官方推荐方案：
+
+```ts
+import { openDatabaseSync } from 'expo-sqlite';
+import { drizzle } from 'drizzle-orm/expo-sqlite';
+
+const expo = openDatabaseSync('db.db');
+export const db = drizzle(expo, { schema });
+```
+
+配套能力：`useMigrations`（`drizzle-orm/expo-sqlite/migrator`）在应用启动时跑迁移；`useLiveQuery` 配合 `openDatabaseSync('db.db', { enableChangeListener: true })` 实现数据变更自动重渲染。`drizzle.config.ts` 必须设 `driver: 'expo'`，并按官方配置 babel 内联 `.sql` 与 metro `sourceExts`。
+
+## OP-SQLite
+
+React Native 的高性能 SQLite 驱动（`@op-engineering/op-sqlite`）：
+
+```ts
+import { open } from '@op-engineering/op-sqlite';
+import { drizzle } from 'drizzle-orm/op-sqlite';
+
+const opsqlite = open({ name: 'myDB' });
+export const db = drizzle(opsqlite, { schema });
+```
+
+迁移用 `useMigrations`（`drizzle-orm/op-sqlite/migrator`），kit 配置同样使用 `driver: 'expo'`。
+
+## React Native quick-sqlite
+
+<Callout type="warn" title="官方已改推荐 Expo SQLite">
+官方文档现明确建议 React Native 应用使用 **Expo SQLite**：`react-native-quick-sqlite` 不支持新的 Hermes 运行时（React Native/Expo 的默认运行时），旧驱动不再推荐，此处不提供初始化代码。
+</Callout>
+
+## SQLite Cloud（v1 RC）
+
+托管 SQLite 云服务，环境变量 `SQLITE_CLOUD_CONNECTION_STRING`，也支持 `drizzle(url)` 简写：
+
+```ts
+import { Database } from '@sqlitecloud/drivers';
+import { drizzle } from 'drizzle-orm/sqlite-cloud';
+
+const client = new Database(process.env.SQLITE_CLOUD_CONNECTION_STRING!);
+export const db = drizzle({ client, schema });
+```
+
+## drizzle HTTP proxy
+
+`drizzle-orm/sqlite-proxy` 支持单条与 batch 两个回调：
+
+```ts
+import { drizzle } from 'drizzle-orm/sqlite-proxy';
+
+const db = drizzle(
+  async (sql, params, method) => {
+    const res = await fetch('https://api.example.com/query', {
+      method: 'POST',
+      body: JSON.stringify({ sql, params, method }),
+    });
+    return { rows: await res.json() };
+  },
+  async (queries) => {
+    // 提供第二个回调后 db.batch() 才可用
+    const res = await fetch('https://api.example.com/batch', {
+      method: 'POST',
+      body: JSON.stringify({ queries }),
+    });
+    return res.json();
+  },
+);
+```
+
+## 下一步
+
+<Cards>
+  <Card title="连接数据库" href="/docs/connections" description="连接基础与环境变量" />
+  <Card title="Batch API" href="/docs/batch" description="多语句原子执行" />
+  <Card title="常见陷阱" href="/docs/gotchas" description="SQLite 布尔与时间戳映射" />
+</Cards>

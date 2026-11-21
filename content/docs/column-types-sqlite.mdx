@@ -1,0 +1,202 @@
+---
+title: SQLite 列类型
+description: drizzle-orm/sqlite-core 列类型参考：integer、real、text、blob、numeric 与 mode 选项（timestamp、boolean、json），存储类映射及枚举/数组的替代方案。
+---
+
+SQLite 只有五种存储类：`NULL`、`INTEGER`、`REAL`、`TEXT`、`BLOB`。列的「类型名」只决定类型亲和性（affinity），实际存什么由值本身决定。Drizzle 据此只提供五个列构造函数，全部从 `drizzle-orm/sqlite-core` 导入，丰富的语义（布尔、时间戳、JSON、大整数）通过 `mode` 选项实现。
+
+```ts title="src/db/schema.ts"
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const users = sqliteTable('users', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+});
+```
+
+## 存储类与构造函数对照
+
+| 构造函数 | 声明的列类型 | 存储类 | TS 类型（默认） |
+| --- | --- | --- | --- |
+| `integer()` | `integer` | INTEGER | `number` |
+| `real()` | `real` | REAL | `number` |
+| `text()` | `text` | TEXT | `string` |
+| `blob()` | `blob` | BLOB | `unknown`（JSON 模式） |
+| `numeric()` | `numeric` | NUMERIC 亲和 | `string` |
+
+## integer 与 mode
+
+`integer` 的 `mode` 决定应用层如何解释这个 64 位整数：
+
+| mode | TS 类型 | 存储内容 | 典型用途 |
+| --- | --- | --- | --- |
+| `'number'`（默认） | `number` | 整数原值 | 计数、外键 |
+| `'boolean'` | `boolean` | 0 / 1 | 布尔标志 |
+| `'timestamp'` | `Date` | Unix 秒 | 创建/更新时间 |
+| `'timestamp_ms'` | `Date` | Unix 毫秒 | 需要毫秒精度的时间 |
+
+```ts
+import { integer, sqliteTable } from 'drizzle-orm/sqlite-core';
+
+export const posts = sqliteTable('posts', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  published: integer('published', { mode: 'boolean' }).notNull().default(false),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  updatedAtMs: integer('updated_at_ms', { mode: 'timestamp_ms' }),
+});
+```
+
+<Callout type="info" title="自增主键">
+SQLite 的自增写法是 `integer('id').primaryKey({ autoIncrement: true })`，对应 `INTEGER PRIMARY KEY AUTOINCREMENT`。只有 `integer` 主键支持自增；不加 `autoIncrement` 时 `INTEGER PRIMARY KEY` 本身就是 rowid 别名，通常已够用且更快。
+</Callout>
+
+`mode: 'number'` 下超过 `Number.MAX_SAFE_INTEGER`（2 的 53 次方减 1）的值会丢精度；需要完整 64 位整数时用 `blob({ mode: 'bigint' })`。
+
+## real
+
+`real()` 对应 8 字节 IEEE 浮点数，无选项。金额等精确小数场景 SQLite 没有原生 decimal，常见做法是以最小单位（分）存 `integer`，或用 `text` / `numeric` 存字符串并在应用层用十进制库运算。
+
+## text 与 mode
+
+`text` 支持三个选项：
+
+| 选项 | 作用 |
+| --- | --- |
+| `length` | 声明 `text(length)`，SQLite 本身不强制长度 |
+| `enum` | 收窄 TS 类型为字面量联合，不做运行时校验 |
+| `mode: 'json'` | TS 类型变为结构化对象，读写自动 JSON 序列化 |
+
+```ts
+import { sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const articles = sqliteTable('articles', {
+  slug: text('slug', { length: 128 }).notNull(),
+  status: text('status', { enum: ['draft', 'published'] }).default('draft'),
+  meta: text('meta', { mode: 'json' }).$type<{ views: number; tags: string[] }>(),
+});
+```
+
+<Callout type="warn" title="JSON 请用 text 而不是 blob">
+官方建议 JSON 数据使用 `text({ mode: 'json' })`：SQLite 的 JSON 函数（`json_extract` 等）不接受 BLOB 输入，存成 blob 会让这些函数失效。
+</Callout>
+
+## blob 与 mode
+
+`blob` 的 `mode` 决定 TS 类型与编码方式：
+
+| mode | TS 类型 | 说明 |
+| --- | --- | --- |
+| `'json'`（默认） | `unknown`，可用 `.$type<T>()` | JSON 序列化后存入 BLOB |
+| `'buffer'` | `Buffer` | 原始二进制 |
+| `'bigint'` | `bigint` | 完整 64 位整数 |
+
+```ts
+import { blob, sqliteTable } from 'drizzle-orm/sqlite-core';
+
+export const assets = sqliteTable('assets', {
+  thumbnail: blob('thumbnail', { mode: 'buffer' }),
+  bigCounter: blob('big_counter', { mode: 'bigint' }),
+});
+```
+
+## numeric
+
+`numeric()` 声明 NUMERIC 亲和性：能无损转成整数或浮点的文本会被转换存储。`mode` 可选 `'string'`（默认）、`'number'`、`'bigint'`，适合需要保留十进制文本的场景。
+
+```ts
+import { numeric, sqliteTable } from 'drizzle-orm/sqlite-core';
+
+export const ledger = sqliteTable('ledger', {
+  amount: numeric('amount', { mode: 'string' }).notNull(), // 保留十进制文本
+});
+```
+
+## 默认值与运行时钩子
+
+- `.default(value)`：常量默认值，写入 DDL。
+- ``.default(sql`...`)``：表达式默认值，如 ``sql`(CURRENT_TIMESTAMP)` ``（注意 SQLite 的 `CURRENT_TIMESTAMP` 产生 UTC 文本，配 `timestamp` 模式时需自行约定格式）。
+- `.$defaultFn(() => ...)`：插入时在应用端计算，不写入 DDL，适合 `crypto.randomUUID()` 之类。
+- `.$onUpdateFn(() => ...)`：每次 update 时在应用端重算，适合 `updatedAt`。
+
+```ts
+import { sql } from 'drizzle-orm';
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const notes = sqliteTable('notes', {
+  id: text('id').primaryKey().$defaultFn(() => crypto.randomUUID()),
+  body: text('body').notNull().default(''),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .$defaultFn(() => new Date())
+    .$onUpdateFn(() => new Date()),
+});
+```
+
+数据库端时间默认值也可以写成 ``text('created_at').default(sql`(CURRENT_TIMESTAMP)`)``，存 ISO 风格文本；应用端钩子则存 Unix 秒，两者不要混用在同一列。
+
+## 日期时间的存储方式对比
+
+SQLite 没有日期类型，官方支持三种存储形态，Drizzle 都能映射：
+
+| 存储形态 | Drizzle 写法 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| Unix 秒 / 毫秒 | `integer({ mode: 'timestamp' })` / `'timestamp_ms'` | 紧凑、比较快、时区无歧义 | 可读性差 |
+| ISO 8601 文本 | `text()` 存 `'2025-01-01 00:00:00'` | 可读、`date()` 等函数直接可用 | 占空间、需约定时区 |
+| 儒略日 | `real()` | 官方日期函数的内部格式 | 应用层几乎不用 |
+
+同一张表内保持一种约定；跨时区应用推荐 Unix 时间戳或统一 UTC 文本。
+
+## 类型亲和性规则
+
+建表时写的类型名按以下顺序决定亲和性（SQLite 官方规则）：
+
+| 类型名包含 | 亲和性 |
+| --- | --- |
+| `INT` | INTEGER |
+| `CHAR`、`CLOB` 或 `TEXT` | TEXT |
+| `BLOB`，或未写类型 | BLOB |
+| `REAL`、`FLOA` 或 `DOUB` | REAL |
+| 其他（如 `NUMERIC`、`DECIMAL`、`BOOLEAN`） | NUMERIC |
+
+因此 `text('x')` 声明为 TEXT 亲和，写入数字会转成文本存储；`numeric` 则尽量把文本转成数值。Drizzle 的五个构造函数已覆盖全部亲和性，`mode` 只影响应用层编解码，不改变存储类。
+
+声明的类型名会原样写入 DDL（如 `text(128)`），便于与既有数据库工具或 dump 文件对照。
+
+## 没有原生类型时的替代方案
+
+SQLite 没有独立的布尔、日期时间、枚举、数组类型，Drizzle 的对应做法：
+
+| 需求 | 推荐写法 | 说明 |
+| --- | --- | --- |
+| 布尔 | `integer({ mode: 'boolean' })` | 存 0/1 |
+| 日期时间 | `integer({ mode: 'timestamp' })` 或 `text` 存 ISO 字符串 | 秒/毫秒时间戳或 `mode: 'string'` 文本 |
+| 大整数 | `blob({ mode: 'bigint' })` | 避免 `number` 精度损失 |
+| 枚举 | `text({ enum: [...] })` 加 `check` 约束 | `enum` 只管 TS 类型，取值约束靠数据库 |
+| 数组 / JSON | `text({ mode: 'json' })` | 可配合 SQLite JSON 函数查询 |
+| 多值关系 | 关联表 | 需要按元素过滤/索引时优于 JSON 数组 |
+
+枚举加 `check` 的完整示例（`check` 详见 [索引与约束](/docs/indexes-constraints)）：
+
+```ts
+import { sql } from 'drizzle-orm';
+import { check, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const tickets = sqliteTable(
+  'tickets',
+  {
+    status: text('status', { enum: ['open', 'closed'] }).notNull().default('open'),
+  },
+  (t) => [check('status_check', sql`${t.status} in ('open', 'closed')`)],
+);
+```
+
+## 接下来
+
+<Cards>
+  <Card title="PostgreSQL 列类型" href="/docs/column-types-postgres" description="pg-core 的完整类型速查与 mode 选项。" />
+  <Card title="MySQL 列类型" href="/docs/column-types-mysql" description="mysql-core 的整数、字符串、日期与枚举类型速查。" />
+  <Card title="索引与约束" href="/docs/indexes-constraints" description="主键、外键、unique、check 与索引的完整用法。" />
+  <Card title="自定义类型" href="/docs/custom-types" description="用 customType 实现更复杂的 SQLite 类型映射。" />
+</Cards>

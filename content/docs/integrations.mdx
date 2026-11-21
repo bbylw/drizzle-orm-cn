@@ -1,0 +1,240 @@
+---
+title: 框架集成
+description: 在 Next.js、SvelteKit、Remix、Astro、Nuxt、Expo 与 tRPC 中接入 Drizzle：初始化位置、查询示例与各自的坑。
+---
+
+Drizzle 与框架无关：核心模式都是**在服务端模块里创建一次 `db` 实例，到处复用**。下面按框架给出初始化位置、一个可运行查询与最容易踩的坑。示例统一假设有 `users` 表与 [schema 定义](/docs/schema)，驱动选择见[连接管理](/docs/connections)。
+
+## Next.js
+
+初始化放在 `lib/db.ts`（服务端专用模块）。Route Handler 与 Server Action 都直接 import：
+
+```ts title="lib/db.ts"
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+import * as schema from './schema';
+
+const client = postgres(process.env.DATABASE_URL!);
+export const db = drizzle(client, { schema });
+```
+
+```ts title="app/api/users/route.ts"
+import { db } from '@/lib/db';
+import { users } from '@/lib/schema';
+
+export async function GET() {
+  const rows = await db.select().from(users).limit(50);
+  return Response.json(rows);
+}
+```
+
+```ts title="app/actions.ts"
+'use server';
+import { db } from '@/lib/db';
+import { users } from '@/lib/schema';
+
+export async function createUser(name: string) {
+  await db.insert(users).values({ name });
+}
+```
+
+<Callout type="warn" title="坑：Edge Runtime 驱动选择">
+`postgres-js` / `node-postgres` 依赖 TCP，只能在 Node.js runtime 使用。Route Handler 声明 `export const runtime = 'edge'` 时要换 HTTP 驱动（如 `drizzle-orm/neon-http`、`drizzle-orm/vercel-postgres`）。另外开发环境热更新会重复创建连接，建议把 client 挂到 `globalThis` 缓存。
+</Callout>
+
+## SvelteKit
+
+初始化放在 `$lib/server/db.ts`——`$lib/server/` 目录保证不会被打包进客户端：
+
+```ts title="src/lib/server/db.ts"
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+import { DATABASE_URL } from '$env/static/private';
+
+const client = postgres(DATABASE_URL);
+export const db = drizzle(client);
+```
+
+```ts title="src/routes/users/+page.server.ts"
+import { db } from '$lib/server/db';
+import { users } from '$lib/server/schema';
+import type { PageServerLoad } from './$types';
+
+export const load: PageServerLoad = async () => {
+  return { users: await db.select().from(users).limit(50) };
+};
+```
+
+页面里用 `data.users` 渲染；写入放在 `+page.server.ts` 的 `actions` 或 `+server.ts` 端点。
+
+<Callout type="warn" title="坑：只在服务端文件里用 db">
+`+page.ts`（ universal load）与组件运行在浏览器，import 服务端 db 会报错或泄漏凭据。数据库访问只放 `+page.server.ts`、`+server.ts`、`+layout.server.ts` 与 `$lib/server/`。
+</Callout>
+
+## Remix / React Router
+
+初始化放在 `app/db.server.ts`——`.server.ts` 后缀让 Remix 保证该模块只在服务端加载：
+
+```ts title="app/db.server.ts"
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+
+const client = postgres(process.env.DATABASE_URL!);
+export const db = drizzle(client);
+```
+
+```tsx title="app/routes/users.tsx"
+import { useLoaderData, Form } from 'react-router';
+import { db } from '~/db.server';
+import { users } from '~/schema.server';
+import type { Route } from './+types/users';
+
+export async function loader() {
+  return { users: await db.select().from(users).limit(50) };
+}
+
+export async function action({ request }: Route.ActionArgs) {
+  const form = await request.formData();
+  await db.insert(users).values({ name: String(form.get('name')) });
+  return { ok: true };
+}
+
+export default function Users() {
+  const { users } = useLoaderData<typeof loader>();
+  return (
+    <div>
+      <ul>{users.map((u) => <li key={u.id}>{u.name}</li>)}</ul>
+      <Form method="post"><input name="name" /><button>添加</button></Form>
+    </div>
+  );
+}
+```
+
+<Callout type="warn" title="坑：模块后缀与部署目标">
+忘记 `.server` 后缀会把数据库代码打进客户端 bundle。部署到 Cloudflare Workers 等 edge 环境时同样要换 HTTP 驱动（D1 用 `drizzle-orm/d1`）。
+</Callout>
+
+## Astro
+
+初始化放在 `src/db.ts`。静态页面在**构建时**查询；API endpoint 与 SSR 页面在请求时查询：
+
+```ts title="src/pages/api/users.json.ts"
+import type { APIRoute } from 'astro';
+import { db } from '../../db';
+import { users } from '../../schema';
+
+// 需要运行时数据时关闭预渲染（配合 SSR adapter）
+export const prerender = false;
+
+export const GET: APIRoute = async () => {
+  const rows = await db.select().from(users).limit(50);
+  return new Response(JSON.stringify(rows), {
+    headers: { 'content-type': 'application/json' },
+  });
+};
+```
+
+`.astro` 页面的 frontmatter 里同样可以直接 `await db.select()...`，把结果渲染进模板。
+
+<Callout type="warn" title="坑：静态与 SSR 的边界">
+纯静态输出（本站模式）下 frontmatter 的查询发生在构建时，数据不会随请求更新；需要运行时数据要启用 SSR adapter 并设 `export const prerender = false`。endpoint 里不要复用构建时的连接假设，serverless 部署优先 HTTP 驱动。
+</Callout>
+
+## Nuxt
+
+初始化放在 `server/utils/db.ts`（Nitro 自动 import），API 放 `server/api/` 或 `server/routes/`：
+
+```ts title="server/utils/db.ts"
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+
+const client = postgres(process.env.DATABASE_URL!);
+export const db = drizzle(client);
+```
+
+```ts title="server/api/users.get.ts"
+import { db } from '../utils/db';
+import { users } from '../utils/schema';
+
+export default defineEventHandler(async () => {
+  return await db.select().from(users).limit(50);
+});
+```
+
+组件里 `const { data } = await useFetch('/api/users')` 消费。
+
+<Callout type="warn" title="坑：db 只属于 Nitro 服务端">
+不要在 Vue 组件或 `composables/`（客户端会执行）里 import db；数据库凭据用 `runtimeConfig` 注入而非硬编码。部署到 edge preset 时换对应 HTTP 驱动。
+</Callout>
+
+## Expo / React Native
+
+移动端用**本地 SQLite**：`expo-sqlite` 打开数据库文件，`drizzle-orm/expo-sqlite` 包装，迁移用内置 migrator hook：
+
+```tsx title="app/_layout.tsx"
+import { Text } from 'react-native';
+import { Stack } from 'expo-router';
+import { drizzle } from 'drizzle-orm/expo-sqlite';
+import { openDatabaseSync } from 'expo-sqlite';
+import { useMigrations } from 'drizzle-orm/expo-sqlite/migrator';
+import migrations from '../drizzle/migrations';
+
+const expoDb = openDatabaseSync('app.db');
+export const db = drizzle(expoDb);
+
+export default function Layout() {
+  const { success, error } = useMigrations(db, migrations);
+  if (error) return <Text>迁移失败：{error.message}</Text>;
+  if (!success) return <Text>迁移中…</Text>;
+  return <Stack />;
+}
+```
+
+```ts
+// 任意组件中同步查询本地库
+const rows = db.select().from(users).all();
+```
+
+迁移文件由 `drizzle-kit generate` 产出、经 metro 配置打包进应用，完整流程见 [SQLite 驱动与迁移](/docs/drivers-sqlite)。
+
+<Callout type="warn" title="坑：本地库不是远程库">
+Expo SQLite 是设备上的文件，没有网络与并发服务端语义；需要云同步时用 Turso/libSQL 的 embedded replicas 方案。`expo-sqlite` 需要 development build，Expo Go 里不可用。
+</Callout>
+
+## tRPC
+
+在 router 的 procedure 里直接用 `db`，输入用 zod 校验（schema 复用见 [zod 集成](/docs/zod)）：
+
+```ts title="server/routers/users.ts"
+import { z } from 'zod';
+import { eq } from 'drizzle-orm';
+import { initTRPC } from '@trpc/server';
+import { db } from '../db';
+import { users } from '../schema';
+
+const t = initTRPC.create();
+
+export const usersRouter = t.router({
+  list: t.procedure
+    .input(z.object({ limit: z.number().int().min(1).max(100).default(20) }))
+    .query(async ({ input }) => {
+      return await db.select().from(users).limit(input.limit);
+    }),
+  create: t.procedure
+    .input(z.object({ name: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      const [row] = await db.insert(users).values(input).returning();
+      return row;
+    }),
+});
+```
+
+<Callout type="warn" title="坑：把校验放在边界">
+tRPC 的 input 校验只保证形状，业务约束（唯一性、外键）仍要靠数据库约束兜底；context 里按请求创建 db 时注意连接池复用，不要每个 procedure 新建连接。
+</Callout>
+
+## 通用清单
+
+- `db` 实例模块级单例，凭据走环境变量，绝不进客户端 bundle。
+- serverless / edge 选 HTTP 驱动，长驻 Node 服务选 TCP 驱动 + 连接池。
+- 迁移统一走 Drizzle Kit，见 [Drizzle Kit](/docs/drizzle-kit) 与[迁移](/docs/migrations)。

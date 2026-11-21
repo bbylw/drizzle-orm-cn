@@ -1,0 +1,144 @@
+---
+title: 集合操作
+description: union、unionAll、intersect、intersectAll、except、exceptAll 的两种写法，以及对合并结果排序与分页。
+---
+
+集合操作把多个 `select` 的结果按集合语义合并：并集、交集、差集。Drizzle 提供两种等价写法——独立函数与链式构建器。本页示例假设已有 `db` 实例与 `users`、`customers` 等表（见 [Schema 声明](/docs/schema)）。
+
+<Callout type="info" title="列必须对齐">
+参与集合操作的各查询必须选择相同数量的列，且对应列类型兼容。结果的列名取自第一个查询。
+</Callout>
+
+## union 与 unionAll
+
+`union` 合并结果并去重；`unionAll` 保留重复行（不排序去重，性能更好）。
+
+<Tabs items={['函数写法', '构建器写法']}>
+<Tab value="函数写法">
+
+```ts
+import { union, unionAll } from 'drizzle-orm/pg-core';
+
+const result = await union(
+  db.select({ name: users.name }).from(users),
+  db.select({ name: customers.name }).from(customers),
+);
+
+const all = await unionAll(
+  db.select({ name: users.name }).from(users),
+  db.select({ name: customers.name }).from(customers),
+);
+```
+
+</Tab>
+<Tab value="构建器写法">
+
+```ts
+const result = await db
+  .select({ name: users.name })
+  .from(users)
+  .union(db.select({ name: customers.name }).from(customers));
+
+const all = await db
+  .select({ name: users.name })
+  .from(users)
+  .unionAll(db.select({ name: customers.name }).from(customers));
+```
+
+</Tab>
+</Tabs>
+
+生成的 SQL（各子查询会被括号包裹）：
+
+```sql
+(select "name" from "users") union (select "name" from "customers")
+```
+
+## intersect 与 intersectAll
+
+只保留同时出现在所有查询中的行；`intersectAll` 按重复次数取交集。
+
+```ts
+import { intersect, intersectAll } from 'drizzle-orm/pg-core';
+
+await intersect(
+  db.select({ name: users.name }).from(users),
+  db.select({ name: customers.name }).from(customers),
+);
+
+// 构建器写法
+await db.select({ name: users.name }).from(users)
+  .intersect(db.select({ name: customers.name }).from(customers));
+```
+
+## except 与 exceptAll
+
+保留出现在第一个查询、但不出现在后续查询中的行；`exceptAll` 按重复次数做差。
+
+```ts
+import { except, exceptAll } from 'drizzle-orm/pg-core';
+
+await except(
+  db.select({ name: users.name }).from(users),
+  db.select({ name: customers.name }).from(customers),
+);
+
+// 构建器写法
+await db.select({ name: users.name }).from(users)
+  .except(db.select({ name: customers.name }).from(customers));
+```
+
+`intersectAll` / `exceptAll` 的用法与上面完全一致，函数与链式方法同名。
+
+## 多个查询串联
+
+函数写法接受任意多个查询；构建器写法可以连续链式调用：
+
+```ts
+await union(query1, query2, query3);
+
+await db.select().from(users)
+  .union(db.select().from(customers))
+  .union(db.select().from(employees));
+```
+
+## 排序与分页
+
+`orderBy`、`limit`、`offset` 作用于**合并后的整体结果**，而不是某个子查询：
+
+```ts
+const result = await union(
+  db.select({ name: users.name }).from(users),
+  db.select({ name: customers.name }).from(customers),
+)
+  .orderBy(sql`name asc`)
+  .limit(10)
+  .offset(20);
+```
+
+```sql
+(select "name" from "users") union (select "name" from "customers")
+order by name asc limit $1 offset $2
+```
+
+<Callout type="warn" title="子查询内部排序">
+若要限制某个分支的行数（如「取最新 10 篇文章再合并」），先在子查询内部 `limit`，必要时用 `.as()` 包一层子查询，再参与集合操作。
+</Callout>
+
+## 方言支持差异
+
+集合操作最终由数据库执行。Drizzle 在方言包（如 `pg-core`、`mysql-core`）中提供这些操作的构建器，但能否真正执行取决于数据库本身的支持范围：
+
+| 操作 | PostgreSQL | MySQL | SQLite |
+| --- | --- | --- | --- |
+| `union` / `unionAll` | 支持 | 支持 | 支持 |
+| `intersect` / `except` | 支持 | 8.0.31 起支持 | 支持 |
+| `intersectAll` / `exceptAll` | 支持 | 不支持（无 `INTERSECT ALL` / `EXCEPT ALL`） | 不支持（无 `INTERSECT ALL` / `EXCEPT ALL`） |
+
+在 MySQL 8.0.31 之前，交集/差集需要改写为 `join` 或 `not exists`；在 SQLite 中可用 `group by` + `having count(*)` 模拟按重复次数的交/差。
+
+## 延伸阅读
+
+- [Select 查询](/docs/select)：子查询与字段选择
+- [Join 查询](/docs/joins)：按关联条件合并（与集合操作语义不同）
+- [别名](/docs/aliases)：子查询与 CTE 命名

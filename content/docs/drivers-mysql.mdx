@@ -1,0 +1,167 @@
+---
+title: MySQL 驱动
+description: mysql2、PlanetScale、TiDB Serverless、Bun SQL 与 HTTP proxy 的初始化代码、环境变量与选型建议。
+---
+
+MySQL 方言的驱动数量少于 PostgreSQL，但覆盖了主流场景：自建 MySQL 用 mysql2，PlanetScale/TiDB 用各自的 serverless 驱动，Bun 运行时可用内置客户端。基础连接概念见 [连接数据库](/docs/connections)。
+
+<Callout type="info" title="版本说明">
+导入路径以官方当前文档为准。标注 **v1 RC** 的驱动需要 `drizzle-orm@rc`；其余在 0.x 稳定版与 v1 中均可用。
+</Callout>
+
+## 驱动速览
+
+| 驱动 | 导入路径 | 适用场景 |
+| --- | --- | --- |
+| mysql2 | `drizzle-orm/mysql2` | 自建/托管 MySQL 的默认选择 |
+| PlanetScale | `drizzle-orm/planetscale-serverless` | PlanetScale（Vitess），HTTP 免 TCP |
+| TiDB Serverless | `drizzle-orm/tidb-serverless` | TiDB Cloud Serverless，HTTP 驱动 |
+| Bun SQL（v1 RC） | `drizzle-orm/bun-sql/mysql` | Bun 内置客户端的 MySQL 方言 |
+| HTTP proxy | `drizzle-orm/mysql-proxy` | 经自建 HTTP 服务查库 |
+
+## mysql2
+
+Node.js 生态最成熟的 MySQL 驱动。连接串简写：
+
+```ts
+import { drizzle } from 'drizzle-orm/mysql2';
+import * as schema from './schema';
+
+export const db = drizzle(process.env.DATABASE_URL!, { schema });
+```
+
+生产环境推荐显式连接池：
+
+```ts
+import mysql from 'mysql2/promise';
+import { drizzle } from 'drizzle-orm/mysql2';
+
+const pool = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  connectionLimit: 10,
+  // 也可展开为 host/user/password/database 等字段
+});
+
+export const db = drizzle({ client: pool, schema });
+```
+
+单连接（脚本、CLI）用 `createConnection`：
+
+```ts
+const connection = await mysql.createConnection({
+  host: 'localhost',
+  user: 'root',
+  database: 'app',
+});
+
+const db = drizzle({ client: connection, schema });
+// 结束时 await connection.end()
+```
+
+注意：`drizzle-orm/mysql2` 同时接受 pool 与 connection，但**事务**在单连接上语义最直观；池模式下 Drizzle 会自动占用一条连接执行事务。
+
+## PlanetScale（serverless 驱动）
+
+环境变量：`DATABASE_HOST`、`DATABASE_USERNAME`、`DATABASE_PASSWORD`。基于 `@planetscale/database`，走 HTTP，适合边缘与 serverless：
+
+```ts
+import { Client } from '@planetscale/database';
+import { drizzle } from 'drizzle-orm/planetscale-serverless';
+
+const client = new Client({
+  host: process.env.DATABASE_HOST,
+  username: process.env.DATABASE_USERNAME,
+  password: process.env.DATABASE_PASSWORD,
+});
+
+export const db = drizzle({ client, schema });
+```
+
+也可让 Drizzle 自建客户端：
+
+```ts
+const db = drizzle({
+  connection: {
+    host: process.env.DATABASE_HOST,
+    username: process.env.DATABASE_USERNAME,
+    password: process.env.DATABASE_PASSWORD,
+  },
+  schema,
+});
+```
+
+<Callout type="warn" title="外键限制">
+PlanetScale 基于 Vitess，**不支持外键约束**：schema 中的 `.references()` 不会在数据库端生效，引用完整性要在应用层保证。跨分片事务能力也有限，以 PlanetScale 官方文档为准。需要真正外键时考虑 PlanetScale Postgres 或普通 MySQL。
+</Callout>
+
+## TiDB Serverless
+
+环境变量：`TIDB_URL`（形如 `mysql://user:pass@host:4000/db?ssl={"minVersion":"TLSv1.2"}`）。TiDB 兼容 MySQL 协议，serverless 驱动走 HTTP：
+
+```ts
+import { connect } from '@tidbcloud/serverless';
+import { drizzle } from 'drizzle-orm/tidb-serverless';
+
+const client = connect({ url: process.env.TIDB_URL! });
+export const db = drizzle({ client, schema });
+```
+
+简写：`drizzle({ connection: { url: process.env.TIDB_URL }, schema })`。适合 TiDB Cloud Serverless 集群；自建 TiDB 可直接用 mysql2 走 MySQL 协议。
+
+## Bun SQL（MySQL 方言，v1 RC）
+
+Bun 内置 `SQL` 客户端也支持 MySQL，注意导入路径带 `/mysql` 后缀（不带后缀的是 PostgreSQL 方言）：
+
+```ts
+import { SQL } from 'bun';
+import { drizzle } from 'drizzle-orm/bun-sql/mysql';
+
+const client = new SQL(process.env.DATABASE_URL!);
+export const db = drizzle({ client, schema });
+```
+
+仅在 Bun 运行时可用，零第三方依赖。
+
+## AWS Data API（MySQL）
+
+<Callout type="error" title="官方尚未实现">
+官方文档明确说明：**Drizzle ORM 目前未实现 AWS Data API 的 MySQL 支持**。PostgreSQL 版可用（`drizzle-orm/aws-data-api/pg`），MySQL 版请勿使用网上流传的导入路径。Lambda 连 RDS MySQL 可考虑 mysql2 + RDS Proxy，或 Data API 的 PostgreSQL 引擎。
+</Callout>
+
+## drizzle HTTP proxy
+
+`drizzle-orm/mysql-proxy` 把构建好的 SQL 交给你的 HTTP 服务执行：
+
+```ts
+import { drizzle } from 'drizzle-orm/mysql-proxy';
+
+const db = drizzle(async (sql, params, method) => {
+  const res = await fetch('https://api.example.com/query', {
+    method: 'POST',
+    body: JSON.stringify({ sql, params, method }),
+  });
+  return { rows: await res.json() };
+});
+```
+
+服务端用 mysql2 执行时，`method === 'all'` 需返回数组形式的行（`rowsAsArray: true`），并对 `TIMESTAMP/DATETIME/DATE` 返回字符串交由 Drizzle 映射。
+
+<Callout type="error" title="安全警告">
+proxy 服务端必须鉴权并限制语句，切勿把任意 SQL 透传到公网接口。
+</Callout>
+
+## 选型建议
+
+- **自建/云 MySQL（RDS、Cloud SQL 等）**：mysql2 连接池，长驻服务最稳。
+- **PlanetScale**：serverless 驱动 + 接受无外键的设计。
+- **TiDB Cloud Serverless**：`tidb-serverless`；HTAP 分析场景受益明显。
+- **Bun 全家桶**：`bun-sql/mysql`，少装一个原生依赖。
+- **无法直连数据库的运行时**：HTTP proxy，或换用支持 HTTP 的托管服务。
+
+## 下一步
+
+<Cards>
+  <Card title="连接数据库" href="/docs/connections" description="环境变量、日志与连接池基础" />
+  <Card title="Schema" href="/docs/schema" description="MySQL 表结构定义" />
+  <Card title="常见陷阱" href="/docs/gotchas" description="驱动与类型映射的坑" />
+</Cards>

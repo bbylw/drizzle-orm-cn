@@ -1,0 +1,155 @@
+---
+title: PostgreSQL 扩展
+description: 在 Drizzle 项目中使用 pgvector、PostGIS、uuid-ossp 等扩展：启用方式、内置列类型与迁移处理。
+---
+
+PostgreSQL 的能力大量来自扩展（extension）：向量检索靠 pgvector，地理数据靠 PostGIS，UUID 生成靠 uuid-ossp 或 pgcrypto。使用 Drizzle 时有一个关键事实需要先说清楚：
+
+<Callout type="warn" title="Drizzle 没有声明扩展的 schema API">
+官方文档明确说明：**没有用于创建扩展的 schema 代码**（不存在 `pgExtension('...')` 这样的 API）。Drizzle 假设扩展已经在数据库中安装好，schema 里只声明依赖扩展的**列类型与索引**。`CREATE EXTENSION` 需要你自己通过 SQL 或自定义迁移执行。
+</Callout>
+
+## 启用扩展：SQL 与自定义迁移
+
+三种常见做法：
+
+```sql
+-- 方式一：直接在数据库执行（托管平台通常在控制台一键开启）
+CREATE EXTENSION IF NOT EXISTS vector;      -- pgvector
+CREATE EXTENSION IF NOT EXISTS postgis;     -- PostGIS
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; -- 注意带连字符要加引号
+```
+
+方式二是**自定义迁移**：`drizzle-kit generate --custom` 生成一个空迁移文件，把 `CREATE EXTENSION IF NOT EXISTS ...` 写进去，随常规迁移一起执行（见 [迁移](/docs/migrations)）。这样新环境从零部署时扩展会自动就位，是团队协作的推荐做法。
+
+方式三是在应用启动时执行一次 ``db.execute(sql`CREATE EXTENSION IF NOT EXISTS ...`)``——简单但要求连接账号有安装权限，Supabase 等平台扩展装在独立 schema，权限模型也不同，不如迁移可靠。
+
+## pgvector：向量列与检索
+
+启用 `vector` 扩展后，`drizzle-orm/pg-core` 内置了 `vector`、`halfvec`、`sparsevec`、`bit` 四种列类型：
+
+```ts title="src/db/schema.ts"
+import { index, pgTable, serial, text, vector, halfvec, sparsevec, bit } from 'drizzle-orm/pg-core';
+
+export const documents = pgTable(
+  'documents',
+  {
+    id: serial('id').primaryKey(),
+    content: text('content'),
+    embedding: vector('embedding', { dimensions: 3 }),      // TS 侧为 number[]
+    halfEmbedding: halfvec('half_embedding', { dimensions: 3 }),
+    sparseEmbedding: sparsevec('sparse_embedding', { dimensions: 5 }),
+    bits: bit('bits', { dimensions: 3 }),                    // TS 侧为 '010' 这样的字符串
+  },
+  (table) => [
+    // HNSW 索引：op() 指定与查询距离匹配的 operator class
+    index('embedding_idx').using('hnsw', table.embedding.op('vector_l2_ops')),
+  ],
+);
+```
+
+插入与默认值直接使用数组：
+
+```ts
+await db.insert(documents).values({
+  content: 'hello',
+  embedding: [0.1, 0.2, 0.3],
+  sparseEmbedding: '{1:0.1,3:0.2}/5', // 稀疏向量用字符串表示
+  bits: '010',
+});
+```
+
+距离函数从 `drizzle-orm` 导入，与索引 operator class 一一对应：
+
+| 函数 | SQL 运算符 | 对应 op class（vector） |
+| --- | --- | --- |
+| `l2Distance` | `<->` | `vector_l2_ops` |
+| `innerProduct` | `<#>` | `vector_ip_ops` |
+| `cosineDistance` | `<=>` | `vector_cosine_ops` |
+| `l1Distance` | `<+>` | `vector_l1_ops` |
+| `hammingDistance`（bit） | `<~>` | `bit_hamming_ops` |
+| `jaccardDistance`（bit） | `<%>` | `bit_jaccard_ops` |
+
+典型的最近邻查询：
+
+```ts
+import { l2Distance, cosineDistance } from 'drizzle-orm';
+
+const nearest = await db
+  .select({ id: documents.id, content: documents.content })
+  .from(documents)
+  .orderBy(l2Distance(documents.embedding, [0.3, 0.1, 0.2]))
+  .limit(5);
+```
+
+<Callout type="info" title="索引与距离函数必须匹配">
+HNSW / IVFFlat 索引只对创建时指定的 operator class 生效：建了 `vector_cosine_ops` 索引却用 `l2Distance` 排序，查询会退化为全表扫描。halfvec / sparsevec 有各自的 `halfvec_*`、`sparsevec_*` op class。
+</Callout>
+
+## PostGIS：几何列与空间索引
+
+启用 `postgis` 后使用内置的 `geometry` 列类型：
+
+```ts title="src/db/schema.ts"
+import { geometry, index, pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const places = pgTable(
+  'places',
+  {
+    id: serial('id').primaryKey(),
+    name: text('name'),
+    // mode: 'xy'（默认）→ TS 值为 { x, y }；'tuple' → [x, y]
+    location: geometry('location', { type: 'point', mode: 'xy', srid: 4326 }),
+  },
+  (table) => [index('spatial_idx').using('gist', table.location)],
+);
+
+await db.insert(places).values({ name: '外滩', location: { x: 121.49, y: 31.24 } });
+```
+
+`type` 支持 `point`、`polygon` 等几何类型，`srid` 指定坐标系。空间查询（`ST_DWithin`、`ST_Distance` 等）没有内置 helper，用 `sql` 模板书写即可。
+
+**PostGIS 的 introspect 陷阱**：PostGIS 会在 `public` 里安装 `spatial_ref_sys` 表（以及 `tiger` 等 schema 的大量对象）。`drizzle-kit pull` / `push` 会把它们当成你的表。用 `extensionsFilters` 排除：
+
+```ts title="drizzle.config.ts"
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/db/schema.ts',
+  dbCredentials: { url: process.env.DATABASE_URL! },
+  extensionsFilters: ['postgis'], // introspect / push 时忽略 PostGIS 自带对象
+});
+```
+
+## uuid-ossp / pgcrypto：函数默认值
+
+这类"纯函数"扩展不需要任何列类型，启用后在默认值里用 `sql` 调用函数：
+
+```ts
+import { sql } from 'drizzle-orm';
+import { pgTable, text, uuid } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  // uuid-ossp
+  id: uuid('id').primaryKey().default(sql`uuid_generate_v4()`),
+  // 或者 pgcrypto
+  token: uuid('token').default(sql`gen_random_uuid()`),
+  name: text('name'),
+});
+```
+
+提示：PG 13+ 内置了 `gen_random_uuid()`（无需扩展），Drizzle 的 `.defaultRandom()` 就是它；只在需要 v1/v5 等其他版本 UUID 时才引入 uuid-ossp。
+
+## 迁移与部署清单
+
+- `CREATE EXTENSION` 放进 `generate --custom` 的自定义迁移，且**排在依赖它的建表迁移之前**。
+- 扩展类型列（`vector`、`geometry`）在扩展未安装的库上执行迁移会直接报 `type "vector" does not exist`——这是最常见的部署顺序错误。
+- 托管平台（Supabase、Neon、RDS 等）对可安装扩展与安装 schema 各有白名单，先查平台文档；Supabase 默认把扩展装进 `extensions` schema，必要时写全限定名或调整 `search_path`（见 [Schemas](/docs/schemas)）。
+- `drizzle-kit` 不会生成 `DROP EXTENSION`，卸载扩展永远是手动操作。
+
+<Cards>
+  <Card title="PostgreSQL 列类型" href="/docs/column-types-postgres" description="vector、geometry 等内置列类型的完整清单。" />
+  <Card title="自定义类型" href="/docs/custom-types" description="扩展提供了新类型但 Drizzle 未内置时，自己映射。" />
+  <Card title="索引与约束" href="/docs/indexes-constraints" description=".using() 与 .op() 的索引声明细节。" />
+</Cards>

@@ -95,17 +95,19 @@ Drizzle 不捆绑连接池、不托管数据库、不要求特定运行时。你
 
 <Cards>
   <Card title="快速开始" href="/docs/quickstart" description="十分钟完成安装、建表、迁移与第一次查询。" />
-  <Card title="为什么选择 Drizzle" href="/docs/why-drizzle" description="理解 Drizzle 的设计取舍，以及它适合什么样的项目。" />
-  <Card title="Schema 与类型" href="/docs/schema" description="用 TypeScript 描述表、列、约束、索引与类型推断。" />
-  <Card title="查询构建器" href="/docs/queries" description="从 select 到 CTE，掌握 SQL 在 Drizzle 中的表达方式。" />
-  <Card title="关联查询" href="/docs/relations" description="定义表关系，一次取出嵌套的数据结构。" />
-  <Card title="迁移与工具链" href="/docs/migrations" description="用 drizzle-kit 生成、审查并执行 SQL 迁移。" />
+  <Card title="升级到 v1" href="/docs/upgrade-v1" description="v0 到 v1 的变化清单与升级步骤。" />
+  <Card title="连接与驱动" href="/docs/connections" description="PostgreSQL、MySQL、SQLite 全驱动与托管提供商接入。" />
+  <Card title="Schema 与列类型" href="/docs/schema" description="表、约束、索引，以及三方言列类型完整速查。" />
+  <Card title="查询 API" href="/docs/queries" description="select / insert / update / delete、操作符、join 与原生 SQL。" />
+  <Card title="关联查询 v2" href="/docs/relations" description="defineRelations 与 db.query，一次取出嵌套结构。" />
+  <Card title="迁移与 Kit" href="/docs/migrations" description="生成、审查、执行迁移，命令全参考与团队协作者流。" />
+  <Card title="校验与集成" href="/docs/zod" description="Zod、valibot、TypeBox、ArkType 与框架集成。" />
 </Cards>
 
 ## 版本说明
 
-<Callout type="warn" title="关于 v1 Beta">
-Drizzle ORM v1 已进入 Beta，其中关系查询（Relations）相关 API 仍在演进。本站示例以当前稳定版 API 为主；涉及 v1 差异的地方会单独标注。生产项目请锁定锁定版本，并以官方迁移指南为准。
+<Callout type="warn" title="关于 v1 Beta / RC">
+Drizzle ORM v1 处于 Beta / RC 阶段，关系查询（`defineRelations`）、内置校验（`drizzle-orm/zod`）等新 API 仍在演进。本站已覆盖这些新 API，并在涉及版本差异处单独标注；生产项目请锁定版本，并以官方迁移指南为准。
 </Callout>
 
 ## 下一步

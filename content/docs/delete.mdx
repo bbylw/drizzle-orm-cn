@@ -1,0 +1,132 @@
+---
+title: SQL Delete
+description: db.delete() 完整参考：where 过滤、returning 返回被删行、跨表条件删除的子查询写法，以及清空表与 truncate 的注意事项。
+---
+
+本页示例沿用[快速开始](/docs/quickstart)中的 `db` 实例与 `users`、`orders` 表。delete 的基本形态是 `db.delete(表).where(条件)`，一次只针对一张表。
+
+## 基本删除
+
+```ts
+import { eq } from 'drizzle-orm';
+import { db } from './db';
+import { users } from './db/schema';
+
+await db.delete(users).where(eq(users.name, 'Dan'));
+// delete from "users" where "name" = $1
+```
+
+<Callout type="error" title="不写 where 会删除全表">
+`await db.delete(users)` 不带 `where()` 时删除表中**所有行**（这是合法 API，不是 bug）。业务代码里务必确认条件存在；批量清理建议放在[事务](/docs/transactions)中并先 select 确认行数。
+</Callout>
+
+条件可以任意组合[运算符](/docs/operators)：
+
+```ts
+import { and, inArray, lt } from 'drizzle-orm';
+
+await db.delete(users).where(
+  and(eq(users.role, 'guest'), lt(users.createdAt, new Date('2025-01-01'))),
+);
+
+await db.delete(users).where(inArray(users.id, [1, 2, 3]));
+```
+
+## returning：拿回被删除的行
+
+<Tabs items={['PostgreSQL', 'SQLite', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```ts
+// 整行返回，常用于审计日志或级联清理
+const deleted = await db.delete(users).where(eq(users.name, 'Dan')).returning();
+
+// 部分返回
+const ids = await db.delete(users)
+  .where(eq(users.name, 'Dan'))
+  .returning({ deletedId: users.id });
+```
+
+</Tab>
+<Tab value="SQLite">
+
+SQLite 3.35+ 支持 `RETURNING`，用法与 PG 相同：
+
+```ts
+await db.delete(users).where(eq(users.name, 'Dan')).returning({ deletedId: users.id });
+```
+
+</Tab>
+<Tab value="MySQL">
+
+MySQL 的 `DELETE` 没有 `RETURNING`。需要被删数据时，在同一事务里先 select 再 delete；只关心影响行数时读取驱动返回的 `affectedRows`（或 mysql2 结果头的 `rowsAffected`）。
+
+</Tab>
+</Tabs>
+
+## 跨表条件删除
+
+官方 v1 的 delete 构建器文档只提供 `where` / `returning` / `WITH`，没有 `DELETE … USING` 或 join 链式语法。按另一张表的条件删除时，用 `exists` / `inArray` 子查询表达：
+
+```ts
+import { eq, inArray, notExists } from 'drizzle-orm';
+import { orders } from './db/schema';
+
+// 删除没有任何订单的用户
+await db.delete(users).where(
+  notExists(db.select().from(orders).where(eq(orders.userId, users.id))),
+);
+
+// 删除下过已取消订单的用户
+await db.delete(users).where(
+  inArray(
+    users.id,
+    db.select({ id: orders.userId }).from(orders).where(eq(orders.status, 'cancelled')),
+  ),
+);
+```
+
+`exists`/`notExists` 与 `inArray` 的子查询形式见[运算符](/docs/operators)。确需原生 `DELETE … USING`（PG）或多表 `DELETE t1 FROM …`（MySQL）时，用 ``db.execute(sql`...`)`` 执行原生 SQL。
+
+## WITH delete
+
+delete 也可以引用 CTE，把"圈定目标"与"执行删除"拆开：
+
+```ts
+import { lt } from 'drizzle-orm';
+
+const stale = db.$with('stale').as(
+  db.select({ id: users.id }).from(users).where(lt(users.lastLoginAt, new Date('2025-01-01'))),
+);
+
+await db.with(stale)
+  .delete(users)
+  .where(inArray(users.id, db.select({ id: stale.id }).from(stale)));
+```
+
+## 清空表：delete 还是 truncate
+
+`db.delete(users)` 逐行删除，会触发行级触发器与外键动作，可回滚。数据量大时可用原生 `TRUNCATE`：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.execute(sql`truncate table ${users} restart identity`); // PG：重置自增序列
+```
+
+| 方言 | 注意事项 |
+| --- | --- |
+| PostgreSQL | `TRUNCATE` 可在事务中回滚；`RESTART IDENTITY` 重置序列，`CASCADE` 连带清空外键引用表 |
+| MySQL | `TRUNCATE` 触发隐式提交，**不能回滚**，等价于 drop + recreate |
+| SQLite | 没有 `TRUNCATE`，`DELETE FROM` 全表即可；`AUTOINCREMENT` 计数需另行清理 `sqlite_sequence` |
+
+## 常见坑
+
+- 外键约束存在时，先删子表行或依赖 schema 中的 `onDelete: 'cascade'`，否则报约束错误。
+- 软删除（``set({ deletedAt: sql`now()` })``）是 update 而不是 delete，见 [SQL Update](/docs/update)。
+- 大批量删除建议分批（`limit` + 循环或按 id 区间），避免长事务与锁表。
+
+<Cards>
+  <Card title="SQL Update" href="/docs/update" description="软删除与批量字段更新。" />
+  <Card title="运算符" href="/docs/operators" description="exists、inArray 子查询条件速查。" />
+</Cards>

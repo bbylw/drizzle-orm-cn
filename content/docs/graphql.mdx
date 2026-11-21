@@ -1,0 +1,158 @@
+---
+title: GraphQL 集成
+description: 用 drizzle-graphql 的 buildSchema(db) 一行生成 GraphQL schema，接入 Apollo Server 或 GraphQL Yoga，并按需裁剪。
+---
+
+`drizzle-graphql` 从 Drizzle schema **一行代码生成 GraphQL 服务**：为每张表自动生成查询与增删改 mutation，表之间的 `relations()` 会映射为可嵌套查询的关联字段。生成的 schema 基于标准 `graphql` SDK，任何兼容该 SDK 的服务器都能使用。
+
+要求 `drizzle-orm` 版本不低于 `0.30.9`。
+
+## 快速开始
+
+```bash
+bun add drizzle-graphql graphql
+```
+
+核心入口是 `buildSchema(db)`，返回两部分：
+
+- `schema`：可直接交给 GraphQL 服务器的完整 `GraphQLSchema`。
+- `entities`：生成过程中的中间产物（queries、mutations、types、inputs），用于自定义裁剪。
+
+```ts
+import { buildSchema } from 'drizzle-graphql';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as dbSchema from './schema';
+
+// 传入 relations，关联字段才会出现在 GraphQL schema 中
+const db = drizzle({ client, schema: dbSchema });
+const { schema, entities } = buildSchema(db);
+```
+
+schema 文件需要同时导出表与 relations：
+
+```ts title="schema.ts"
+import { integer, serial, text, pgTable } from 'drizzle-orm/pg-core';
+import { relations } from 'drizzle-orm';
+
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+});
+
+export const usersRelations = relations(users, ({ many }) => ({
+  posts: many(posts),
+}));
+
+export const posts = pgTable('posts', {
+  id: serial('id').primaryKey(),
+  content: text('content').notNull(),
+  authorId: integer('author_id').notNull(),
+});
+
+export const postsRelations = relations(posts, ({ one }) => ({
+  author: one(users, { fields: [posts.authorId], references: [users.id] }),
+}));
+```
+
+## 接入 Apollo Server
+
+```bash
+bun add drizzle-graphql @apollo/server graphql
+```
+
+```ts title="server.ts"
+import { buildSchema } from 'drizzle-graphql';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { ApolloServer } from '@apollo/server';
+import { startStandaloneServer } from '@apollo/server/standalone';
+import * as dbSchema from './schema';
+import client from './db';
+
+const db = drizzle({ client, schema: dbSchema });
+const { schema } = buildSchema(db);
+
+const server = new ApolloServer({ schema });
+const { url } = await startStandaloneServer(server);
+console.log(`Server ready at ${url}`);
+```
+
+## 接入 GraphQL Yoga
+
+```bash
+bun add drizzle-graphql graphql-yoga graphql
+```
+
+```ts title="server.ts"
+import { buildSchema } from 'drizzle-graphql';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { createYoga } from 'graphql-yoga';
+import { createServer } from 'node:http';
+import * as dbSchema from './schema';
+
+const db = drizzle({ schema: dbSchema });
+const { schema } = buildSchema(db);
+
+const yoga = createYoga({ schema });
+const server = createServer(yoga);
+server.listen(4000, () => {
+  console.info('Server is running on http://localhost:4000/graphql');
+});
+```
+
+## 自动生成了什么
+
+- **查询**：每张表一个列表查询（如 `users`），以及单条查询（形如 `customersSingle` 的命名）。
+- **mutation**：每张表的插入、更新、删除操作，集中在 `entities.mutations`。
+- **关联**：`relations()` 声明的 one/many 关系成为嵌套字段，例如查 `users` 时带出 `posts`。
+- **类型与输入**：`entities.types`（如 `UsersItem`）与 `entities.inputs`（如 `UsersFilters`）可复用于自定义字段。
+
+## 自定义与裁剪
+
+不想暴露全部自动生成的操作时，用 `entities` 手工组装 `GraphQLSchema`——只挑选需要的查询，或复用生成的类型写自定义 resolver：
+
+```ts
+import { buildSchema } from 'drizzle-graphql';
+import { GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLSchema } from 'graphql';
+
+const { entities } = buildSchema(db);
+
+const schema = new GraphQLSchema({
+  query: new GraphQLObjectType({
+    name: 'Query',
+    fields: {
+      users: entities.queries.users, // 只暴露想要的查询
+      customer: entities.queries.customersSingle,
+      customUsers: {
+        // 复用生成的类型与输入
+        type: new GraphQLList(new GraphQLNonNull(entities.types.UsersItem)),
+        args: { where: { type: entities.inputs.UsersFilters } },
+        resolve: async (source, args, context, info) => {
+          // 自定义逻辑，例如 db.select()...
+          return [];
+        },
+      },
+    },
+  }),
+  mutation: new GraphQLObjectType({
+    name: 'Mutation',
+    fields: entities.mutations, // mutation 同理可裁剪
+  }),
+  types: [...Object.values(entities.types), ...Object.values(entities.inputs)],
+});
+```
+
+## 限制与适用场景
+
+- 自动生成的 CRUD 面向 schema 中的**所有表**。对外服务前务必用 `entities` 裁剪，并自行实现鉴权与字段级权限——库本身不提供认证。
+- 生成逻辑依赖 `relations()` 声明；没有声明关系的表只能平铺查询。
+- 复杂聚合、跨表事务等业务逻辑，仍应写自定义 resolver，内部照常用 Drizzle 查询。
+
+适合：内部管理后台、原型、快速给既有 Drizzle 项目加一层 GraphQL API。不适合：需要精细契约控制的大型公共 API（此时手写 schema 更可控）。
+
+## 下一步
+
+<Cards>
+  <Card title="关系" href="/docs/relations" description="relations() 决定 GraphQL 的嵌套字段" />
+  <Card title="查询" href="/docs/queries" description="自定义 resolver 中的 Drizzle 查询" />
+  <Card title="Zod 校验" href="/docs/zod" description="REST/tRPC 路线的入参校验" />
+</Cards>

@@ -1,0 +1,150 @@
+---
+title: 多 Schema 组织
+description: 用 pgSchema 与 mysqlSchema 把表、枚举、序列组织进独立命名空间，并配置 drizzle-kit 的 schemaFilter。
+---
+
+PostgreSQL 的 schema 是数据库内的命名空间（默认是 `public`）；MySQL 中 schema 与 database 是同义词。Drizzle 通过 `pgSchema('name')` / `mysqlSchema('name')` 声明命名空间，再用 `.table()`、`.enum()`、`.sequence()` 等方法在其中创建对象。SQLite 没有 schema 概念（`ATTACH` 的库不在 Drizzle 建模范围内）。
+
+## 声明与使用
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```ts title="src/db/schema.ts"
+import { pgSchema, serial, text } from 'drizzle-orm/pg-core';
+
+// 声明命名空间
+export const billing = pgSchema('billing');
+
+// 枚举、序列、表都挂在 schema 上
+export const invoiceStatus = billing.enum('invoice_status', ['draft', 'paid']);
+export const invoiceSeq = billing.sequence('invoice_seq', { startWith: 1000 });
+
+export const invoices = billing.table('invoices', {
+  id: serial('id').primaryKey(),
+  status: invoiceStatus('status').default('draft').notNull(),
+  memo: text('memo'),
+});
+```
+
+生成的迁移会先建 schema，再建其中的对象：
+
+```sql
+CREATE SCHEMA "billing";
+CREATE TYPE "billing"."invoice_status" AS ENUM ('draft', 'paid');
+CREATE SEQUENCE "billing"."invoice_seq" START WITH 1000;
+CREATE TABLE "billing"."invoices" (
+  "id" serial PRIMARY KEY,
+  "status" "billing"."invoice_status" DEFAULT 'draft' NOT NULL,
+  "memo" text
+);
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```ts title="src/db/schema.ts"
+import { int, mysqlSchema, text } from 'drizzle-orm/mysql-core';
+
+// MySQL 中 schema 即 database
+export const shop = mysqlSchema('shop');
+
+export const products = shop.table('products', {
+  id: int('id').primaryKey().autoincrement(),
+  name: text('name'),
+});
+```
+
+查询会生成跨库限定名 ``select ... from `shop`.`products` ``。前提是连接账号对目标 database 有权限，且该 database 已存在——MySQL 方言下 `drizzle-kit` 对 `CREATE DATABASE` 的生成依版本而定，跨库场景建议先在实例上建好库。
+
+</Tab>
+</Tabs>
+
+## 查询：自动带上限定名
+
+schema 中的表在查询时会自动生成 `"billing"."invoices"` 这样的限定名，**不依赖连接的 `search_path`**：
+
+```ts
+import { eq } from 'drizzle-orm';
+import { invoices } from './schema';
+
+// SQL: select ... from "billing"."invoices" where "billing"."invoices"."id" = $1
+const rows = await db.select().from(invoices).where(eq(invoices.id, 1));
+```
+
+跨 schema 的外键与 join 也没问题——直接引用不同 schema 导出的表对象即可：
+
+```ts
+import { pgTable, serial, integer } from 'drizzle-orm/pg-core';
+import { invoices } from './schema'; // billing schema 中的表
+
+// public 中的表引用 billing 中的表
+export const payments = pgTable('payments', {
+  id: serial('id').primaryKey(),
+  invoiceId: integer('invoice_id')
+    .notNull()
+    .references(() => invoices.id), // 生成 references "billing"."invoices"("id")
+});
+```
+
+## 与默认 public 的关系
+
+- `pgTable(...)` 声明的表**不带 schema 前缀**，落在连接 `search_path` 的第一个可写 schema，通常是 `public`。
+- `pgSchema('public')` 也可以显式声明 public，生成 `"public"."users"` 这样的限定名。两种写法在 drizzle-kit 眼里是**不同实体**，混用会导致 generate 反复生成删表/建表，一个项目里只选一种。
+- 同一个 `pgSchema('billing')` 可以在多个文件里重复调用（同名即同一命名空间），便于按业务拆分文件：
+
+```ts
+// src/db/billing/invoices.ts 与 src/db/billing/refunds.ts 各自：
+export const billing = pgSchema('billing');
+```
+
+## drizzle-kit 的 schemaFilter
+
+默认情况下 `introspect`（pull）与 `push` 只处理 `public`。要管理其他 schema，必须在 `drizzle.config.ts` 里配置 `schemaFilter`：
+
+```ts title="drizzle.config.ts"
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dbCredentials: { url: process.env.DATABASE_URL! },
+  // introspect / push 时纳入这些 schema
+  schemaFilter: ['public', 'billing'],
+});
+```
+
+<Callout type="warn" title="schemaFilter 缺失的后果">
+如果 schema 里有表但 `schemaFilter` 没包含它，`push` 会认为数据库里"多出了"这些表并可能提议删除；`introspect` 则会漏掉它们。管理多 schema 时这是最常见的事故来源。`generate` 不受 `schemaFilter` 影响——它只看 schema 文件。
+</Callout>
+
+Supabase 等项目还常用 `entities`、`extensionsFilters` 等配置排除托管对象，参见 [扩展](/docs/extensions) 与 [drizzle-kit](/docs/drizzle-kit)。
+
+## search_path 注意事项
+
+Drizzle 生成的 SQL 都带限定名，但**手写 `sql` 片段不会自动加前缀**：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+// 危险：依赖 search_path，换个连接配置可能查错表
+await db.execute(sql`select * from invoices`);
+
+// 安全：显式限定
+await db.execute(sql`select * from billing.invoices`);
+```
+
+同理，列默认值里的 `nextval('invoice_seq')`、函数调用、`CHECK` 约束中的裸对象名都受 `search_path` 影响。托管数据库（Supabase、Neon 等）的默认 `search_path` 各不相同，写原生 SQL 时一律带 schema 限定最稳妥。
+
+## 迁移行为小结
+
+- 新增 `pgSchema` 会生成 `CREATE SCHEMA`；从 schema 文件中移除声明会生成 `DROP SCHEMA`（连带对象），删 schema 前务必确认数据去向。
+- 把表从 public 挪进 schema（`pgTable` 改为 `schema.table`）会被视为**删旧表 + 建新表**，不是 ALTER ... SET SCHEMA，数据会丢失——这类重构必须手写自定义迁移（见 [迁移](/docs/migrations)）。
+- 序列、枚举、视图（`schema.view(...)`）都可以挂在 schema 下，行为与 public 中一致。
+
+<Cards>
+  <Card title="序列" href="/docs/sequences" description="在 schema 中声明序列并跨表共享编号。" />
+  <Card title="视图" href="/docs/views" description="schema.view 与物化视图的声明方式。" />
+  <Card title="drizzle-kit" href="/docs/drizzle-kit" description="配置文件与各命令的完整说明。" />
+</Cards>

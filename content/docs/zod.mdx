@@ -1,0 +1,156 @@
+---
+title: Zod 校验
+description: 用 drizzle-zod 从表定义生成 insert/select/update 校验 schema，refine 定制、coerce 类型转换与 tRPC/表单集成。
+---
+
+`drizzle-zod` 把 Drizzle 表定义直接转换成 [Zod](https://zod.dev) schema：列类型、非空、默认值、枚举都会映射成对应的校验规则。一份 schema 同时服务于数据库写入与 API 入参校验，避免两处定义漂移。支持 PostgreSQL、MySQL、SQLite 全部方言，表、视图与枚举都可以转换。
+
+## 安装
+
+```bash
+bun add drizzle-zod zod
+```
+
+## 三个核心函数
+
+```ts
+import { pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+import { createInsertSchema, createSelectSchema, createUpdateSchema } from 'drizzle-zod';
+
+const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull(),
+  role: text('role', { enum: ['admin', 'user'] }).notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+// 插入校验：有默认值/可空的列变为可选
+const insertUserSchema = createInsertSchema(users);
+// 更新校验：所有列都可选
+const updateUserSchema = createUpdateSchema(users);
+// 查询校验：反映实际查出的行形状
+const selectUserSchema = createSelectSchema(users);
+```
+
+| 函数 | 用途 | 典型场景 |
+| --- | --- | --- |
+| `createInsertSchema` | 插入数据的形状 | 校验 API 请求体 |
+| `createUpdateSchema` | 更新数据的形状（全部可选） | PATCH 类接口 |
+| `createSelectSchema` | 查询结果的形状 | 校验 API 响应 |
+
+```ts
+const user = insertUserSchema.parse({
+  name: 'John Doe',
+  email: 'johndoe@test.com',
+  role: 'admin',
+});
+await db.insert(users).values(user);
+```
+
+## refine：扩展与覆盖
+
+第二个参数按列定制规则。**传回调**是在默认 schema 上扩展（在变为 nullable/optional 之前生效）；**直接传 Zod schema** 则完全覆盖该列（包括可空性）：
+
+```ts
+import { z } from 'zod';
+
+const insertUserSchema = createInsertSchema(users, {
+  id: (schema) => schema.positive(), // 扩展
+  email: (schema) => schema.email(), // 扩展
+  role: z.string(), // 覆盖：不再限制为枚举
+});
+```
+
+生成的仍是普通 Zod 对象，可以自由组合：
+
+```ts
+// 只暴露部分字段给外部
+const publicUserSchema = selectUserSchema.pick({ id: true, name: true });
+// 追加表之外的字段
+const signupSchema = insertUserSchema.extend({
+  password: z.string().min(8),
+});
+```
+
+## 与 tRPC 集成
+
+insert schema 直接作为 procedure 的 input，类型自动推导：
+
+```ts
+import { initTRPC } from '@trpc/server';
+
+const t = initTRPC.create();
+
+export const createUser = t.procedure
+  .input(createInsertSchema(users))
+  .mutation(async ({ input }) => {
+    return db.insert(users).values(input).returning();
+  });
+```
+
+## 与表单集成
+
+表单数据都是字符串，用 `safeParse` 拿到结构化错误，再配合 coerce 做类型转换：
+
+```ts
+const formSchema = createInsertSchema(users, {
+  name: (s) => s.min(1, '请输入姓名').max(50),
+  email: (s) => s.email('邮箱格式不正确'),
+}).pick({ name: true, email: true });
+
+const result = formSchema.safeParse(Object.fromEntries(new FormData(form)));
+if (!result.success) {
+  // result.error.issues 可直接映射到表单字段错误
+}
+```
+
+### coerce：日期与数字
+
+`createSchemaFactory` 可以生成带类型强转的 create 函数。`coerce: true` 转换所有类型，也可以只指定部分：
+
+```ts
+import { createSchemaFactory } from 'drizzle-zod';
+
+const { createInsertSchema } = createSchemaFactory({
+  coerce: { date: true, number: true },
+});
+
+// timestamp 列现在接受 '2024-01-01' 这样的字符串，自动转为 Date
+const insertWithCoerce = createInsertSchema(users);
+```
+
+可选的 coerce 键：`bigint`、`boolean`、`date`、`number`、`string`。
+
+## Zod v4 兼容
+
+`drizzle-zod` 同时支持 Zod 3（3.25+）与 Zod 4。使用 Zod 4 时，可以通过 `zodInstance` 传入扩展实例（例如 `zod/v4` 子路径或 `@hono/zod-openapi`）：
+
+```ts
+import { z } from 'zod/v4';
+import { createSchemaFactory } from 'drizzle-zod';
+
+const { createInsertSchema } = createSchemaFactory({ zodInstance: z });
+```
+
+<Callout type="info" title="drizzle-orm v1：校验已内置">
+官方最新文档中，Zod 集成已内置为 `drizzle-orm/zod` 子路径（随 drizzle-orm v1 提供，当前安装 `drizzle-orm@rc`），函数名不变：`createInsertSchema` / `createSelectSchema` / `createUpdateSchema` / `createSchemaFactory`，refine 与 coerce 的写法也一致。v0.x 项目继续使用独立的 `drizzle-zod` 包即可。
+</Callout>
+
+```ts
+// v1 内置写法（官方当前文档）
+import { createInsertSchema } from 'drizzle-orm/zod';
+import { z } from 'zod/v4';
+
+const insertUserSchema = createInsertSchema(users, {
+  name: (schema) => schema.max(20),
+});
+```
+
+## 下一步
+
+<Cards>
+  <Card title="其他校验集成" href="/docs/validations" description="valibot、TypeBox、ArkType、Effect Schema" />
+  <Card title="Schema 与类型" href="/docs/schema" description="列类型决定生成的校验规则" />
+  <Card title="Drizzle Seed" href="/docs/seed" description="为测试准备确定性数据" />
+</Cards>

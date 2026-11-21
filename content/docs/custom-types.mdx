@@ -1,0 +1,201 @@
+---
+title: 自定义类型（customType）
+description: 用 customType 的 dataType、toDriver、fromDriver 三个函数映射任意数据库列类型，对比 $type 的取舍。
+---
+
+内置列类型覆盖不了的场景——PostgreSQL 的 `point`、扩展提供的新类型、加密存储的字符串、带品牌标记的 ID——都可以用 `customType` 自己映射。三个方言的 core 包（`pg-core`、`mysql-core`、`sqlite-core`）都导出了 `customType`，用法一致。
+
+## 三个核心函数
+
+```ts
+import { customType } from 'drizzle-orm/pg-core';
+
+const myType = customType<{ data: number; driverData: string }>({
+  // 必填：返回 DDL 中的 SQL 类型名
+  dataType() {
+    return 'numeric';
+  },
+  // 可选：写入方向，TS 值 → 驱动可接受的值（也可以返回 SQL）
+  toDriver(value: number): string {
+    return value.toString();
+  },
+  // 可选：读取方向，驱动返回的值 → TS 值
+  fromDriver(value: string): number {
+    return Number(value);
+  },
+});
+```
+
+`dataType` 是**唯一必填**的函数，决定迁移里的列类型；`toDriver` 在写入时于参数发给驱动前转换；`fromDriver` 在读取时于结果交给你之前转换。只写 `dataType` 就能得到一个"改了 TS 类型、不改运行时行为"的列。
+
+泛型参数：`data`（应用侧类型，必填）、`driverData`（驱动原始类型，默认同 `data`）、`config`（列构建器的配置对象类型）、`configRequired`（配置是否必填）。带配置的例子：
+
+```ts
+const customTimestamp = customType<{
+  data: Date;
+  driverData: string;
+  config: { withTimezone: boolean; precision?: number };
+}>({
+  dataType(config) {
+    const precision = config?.precision !== undefined ? `(${config.precision})` : '';
+    return `timestamp${precision}${config?.withTimezone ? ' with time zone' : ''}`;
+  },
+  toDriver(value: Date) {
+    return value.toISOString();
+  },
+  fromDriver(value: string) {
+    return new Date(value);
+  },
+});
+
+// 使用时像内置类型一样传配置
+// createdAt: customTimestamp('created_at', { withTimezone: true }).notNull().default(sql`now()`)
+```
+
+## 实战例子
+
+### PostgreSQL point
+
+```ts title="src/db/schema.ts"
+import { customType, pgTable, serial } from 'drizzle-orm/pg-core';
+
+const point = customType<{ data: { x: number; y: number } }>({
+  dataType() {
+    return 'point';
+  },
+  toDriver(value) {
+    return `(${value.x},${value.y})`; // PG point 的字面量格式
+  },
+  // 省略 fromDriver：node-postgres 已把 point 解析为 { x, y }，原样透传
+});
+
+export const places = pgTable('places', {
+  id: serial('id').primaryKey(),
+  location: point('location').notNull(),
+});
+```
+
+<Callout type="warn" title="fromDriver 的输入取决于驱动">
+`driverData` 要按**你实际使用的驱动**声明：node-postgres 对 `point` 返回对象，对 `numeric` 返回字符串，对 `int8` 返回字符串；postgres.js、Bun、Neon HTTP 各不相同。写自定义类型前先用内置类型或 `db.execute` 打印一次原始返回值确认。
+</Callout>
+
+### 加密字符串（透明加解密）
+
+```ts
+import { customType, pgTable, serial, text } from 'drizzle-orm/pg-core';
+import { encrypt, decrypt } from './crypto'; // 你的加解密实现
+
+const encryptedText = customType<{ data: string }>({
+  dataType() {
+    return 'text'; // 数据库里存的仍是 text（密文）
+  },
+  toDriver(value: string) {
+    return encrypt(value);
+  },
+  fromDriver(value: string) {
+    return decrypt(value);
+  },
+});
+
+export const secrets = pgTable('secrets', {
+  id: serial('id').primaryKey(),
+  apiKey: encryptedText('api_key').notNull(),
+});
+```
+
+注意：`where(eq(secrets.apiKey, '明文'))` 会经 `toDriver` 加密后比对，只有**确定性加密**才能命中；随机 IV 的加密无法做等值查询，也无法对该列建有效索引。
+
+### 品牌化 ID（零运行时开销）
+
+```ts
+type UserId = string & { readonly __brand: 'UserId' };
+
+const userId = customType<{ data: UserId }>({
+  dataType() {
+    return 'uuid';
+  },
+  // 不写 toDriver / fromDriver：值原样透传，只有类型层面收紧
+});
+```
+
+这样 `UserId` 与普通 `string` 不能互相误传，编译期就能拦住"把 orderId 传给 userId 参数"的错误。
+
+## $type 还是 customType？
+
+| | `$type<T>()` | `customType` |
+| --- | --- | --- |
+| 改变 DDL 类型 | 否 | 是（`dataType`） |
+| 运行时转换 | 无，`$type` 只是类型断言 | `toDriver` / `fromDriver` 真实执行 |
+| 适用 | JSON 列的结构、text 存枚举等"值本来就是对的"场景 | 数据库类型或值的表示需要转换 |
+
+例如 `jsonb('meta').$type<{ theme: string }>()` 只是告诉 TS 结构，值不做任何变换——这用 `$type` 就够；而 `point`、加密、字符串转 `Date` 必须 `customType`。**`$type` 撒谎不会有运行时报错，`customType` 的转换错了才会**，这是两者的本质区别。
+
+## 三个方言的差异
+
+`customType` 的 API 三方言完全一致，差别只在 `dataType` 返回的类型名与驱动的原始值：
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+```ts
+import { customType } from 'drizzle-orm/pg-core';
+
+const inet = customType<{ data: string }>({
+  dataType() {
+    return 'inet'; // PG 特有类型随意映射
+  },
+});
+```
+
+类型系统最丰富（`inet`、`cidr`、`interval`、扩展类型等），是 `customType` 的主战场。
+
+</Tab>
+<Tab value="MySQL">
+
+```ts
+import { customType } from 'drizzle-orm/mysql-core';
+
+const unsignedInt = customType<{ data: number }>({
+  dataType() {
+    return 'int unsigned';
+  },
+});
+```
+
+mysql2 等驱动对 `bigint`、`decimal` 返回字符串，对 `date` 返回 `Date`，`fromDriver` 按此处理。
+
+</Tab>
+<Tab value="SQLite">
+
+```ts
+import { customType } from 'drizzle-orm/sqlite-core';
+
+const jsonText = customType<{ data: unknown; driverData: string }>({
+  dataType() {
+    return 'text'; // SQLite 只有五种存储类别，自定义的多是"编码约定"
+  },
+  toDriver(value) {
+    return JSON.stringify(value);
+  },
+  fromDriver(value) {
+    return JSON.parse(value);
+  },
+});
+```
+
+SQLite 类型是亲和性（affinity），`dataType` 写 `text` / `integer` / `real` / `blob` 即可，重点在两个转换函数。
+
+</Tab>
+</Tabs>
+
+## 迁移与使用注意
+
+- `drizzle-kit` 只认 `dataType()` 的返回值：改转换函数**不会生成迁移**，但会改变新旧数据的解读方式——存量数据格式变更要自己写数据迁移。
+- `dataType` 返回的类型若来自扩展，需先安装扩展（见 [PostgreSQL 扩展](/docs/extensions)）。
+- 自定义类型列同样支持 `.notNull()`、`.default()`、`.primaryKey()` 等全部构建器方法；``.default(sql`...`)`` 里的 SQL 不经 `toDriver`，要写数据库侧的字面量。introspect（pull）遇到不认识的类型会生成 `customType` 存根，转换函数需自己补。
+
+<Cards>
+  <Card title="PostgreSQL 列类型" href="/docs/column-types-postgres" description="先查内置类型，多数场景无需自定义。" />
+  <Card title="MySQL 列类型" href="/docs/column-types-mysql" description="MySQL 内置类型与驱动返回值对照。" />
+  <Card title="SQLite 列类型" href="/docs/column-types-sqlite" description="SQLite 的存储类别与模式选项。" />
+</Cards>

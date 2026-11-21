@@ -1,0 +1,234 @@
+---
+title: PostgreSQL 列类型
+description: drizzle-orm/pg-core 列类型完整参考：整数、浮点、精确小数、字符串、日期时间、JSON、UUID、枚举、数组、几何、网络与向量类型及常用选项。
+---
+
+所有 PostgreSQL 列构造函数都从 `drizzle-orm/pg-core` 导入。每个构造函数对应一个原生 PG 类型，并通过配置对象与链式方法控制精度、时区、默认值等行为。本页按类别给出完整速查表；约束与索引见 [索引与约束](/docs/indexes-constraints)，自定义映射见 [自定义类型](/docs/custom-types)。
+
+```ts title="src/db/schema.ts"
+import { pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+});
+```
+
+## 整数与自增整数
+
+| 构造函数 | PG 类型 | TS 类型 | 说明 |
+| --- | --- | --- | --- |
+| `integer()`（别名 `int()`、`int4()`） | `integer` | `number` | 32 位有符号整数 |
+| `smallint()`（别名 `int2()`） | `smallint` | `number` | 16 位有符号整数 |
+| `bigint()`（别名 `int8()`） | `bigint` | `bigint`（默认）或 `number` | 64 位，`mode` 可选 |
+| `serial()` | `serial` | `number` | 自增 32 位，隐含 `NOT NULL` |
+| `smallserial()` | `smallserial` | `number` | 自增 16 位 |
+| `bigserial()` | `bigserial` | `bigint`（默认）或 `number` | 自增 64 位，`mode` 可选 |
+
+`bigint` 与 `bigserial` 的 `mode: 'number'` 会把值转成 JS `number`，超出 `Number.MAX_SAFE_INTEGER` 时会丢失精度；需要完整 64 位范围时保持默认的 `bigint` 模式。
+
+```ts
+import { bigint, bigserial, integer, pgTable } from 'drizzle-orm/pg-core';
+
+export const counters = pgTable('counters', {
+  id: bigserial('id', { mode: 'number' }).primaryKey(),
+  views: bigint('views', { mode: 'bigint' }).notNull(), // 保持 bigint
+  score: integer('score').default(0),
+});
+```
+
+<Callout type="info" title="serial 还是 identity？">
+`serial` 底层是序列加默认值；PG 10+ 更推荐 SQL 标准的 identity 列：`integer('id').generatedAlwaysAsIdentity()` 或 `.generatedByDefaultAsIdentity({ startWith: 1000 })`。序列的独立管理见 [序列](/docs/sequences)。
+</Callout>
+
+## 浮点与精确小数
+
+| 构造函数 | PG 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `real()` | `real`（`float4`） | `number` | 无 |
+| `doublePrecision()` | `double precision`（`float8`） | `number` | 无 |
+| `numeric()`（别名 `decimal()`） | `numeric` | `string`（默认）、`number` 或 `bigint` | `precision`、`scale`、`mode` |
+
+`numeric` 的 `precision` 是总位数，`scale` 是小数位数。`mode` 决定查询结果的 JS 类型：默认 `'string'` 最安全，`'number'` 有精度风险，`'bigint'` 只适合无小数的场景。
+
+```ts
+import { doublePrecision, numeric, pgTable, real } from 'drizzle-orm/pg-core';
+
+export const products = pgTable('products', {
+  price: numeric('price', { precision: 10, scale: 2 }).notNull(), // string
+  weight: real('weight'),
+  ratio: doublePrecision('ratio'),
+});
+```
+
+<Callout type="warn" title="金额不要用浮点">
+`real` 与 `doublePrecision` 是近似类型，金额、计费等场景请使用 `numeric` 并保持字符串模式，在应用层用十进制库运算。
+</Callout>
+
+## 字符串与文本
+
+| 构造函数 | PG 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `text()` | `text` | `string` | `enum` |
+| `varchar()` | `varchar` | `string` | `length`、`enum` |
+| `char()` | `char` | `string` | `length`、`enum` |
+
+`varchar` 不传 `length` 时等价于无长度限制；`char` 会按长度补空格。`enum` 选项只收窄 TypeScript 类型（联合字面量），**不会**在数据库或运行时做校验——需要真正的枚举约束请用 `pgEnum` 或 `check`。
+
+```ts
+import { char, pgTable, text, varchar } from 'drizzle-orm/pg-core';
+
+export const articles = pgTable('articles', {
+  slug: varchar('slug', { length: 128 }).notNull(),
+  countryCode: char('country_code', { length: 2 }),
+  status: text('status', { enum: ['draft', 'published'] }).default('draft'),
+});
+```
+
+## 布尔与二进制
+
+| 构造函数 | PG 类型 | TS 类型 | 说明 |
+| --- | --- | --- | --- |
+| `boolean()` | `boolean` | `boolean` | 无选项 |
+| `bytea()` | `bytea` | `string` | 二进制数据，十六进制字符串表示 |
+
+<Callout type="info" title="bytea 的版本差异">
+`bytea()` 见于官方列类型文档，但部分 drizzle-orm 发行版未导出该构造函数。若导入报错，可用 [customType](/docs/custom-types) 映射 `bytea`，或升级 drizzle-orm 后再试。
+</Callout>
+
+## 日期与时间
+
+| 构造函数 | PG 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `date()` | `date` | `Date`（默认）或 `string` | `mode: 'date'` 或 `'string'` |
+| `time()` | `time` / `timetz` | `string` | `precision`（0–6）、`withTimezone` |
+| `timestamp()` | `timestamp` / `timestamptz` | `Date`（默认）或 `string` | `precision`（0–6）、`withTimezone`、`mode` |
+| `interval()` | `interval` | `string` | `fields`（如 `'day to second'`）、`precision` |
+
+`withTimezone: true` 生成 `timestamptz`，存储 UTC 时刻并按会话时区展示；`mode: 'string'` 让驱动原样返回字符串，避免 `Date` 转换。`timestamp` 支持 `.defaultNow()`（生成 `now()`）。
+
+```ts
+import { date, interval, pgTable, time, timestamp } from 'drizzle-orm/pg-core';
+
+export const events = pgTable('events', {
+  day: date('day', { mode: 'string' }).notNull(), // '2025-01-01'
+  startsAt: time('starts_at', { precision: 0, withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  duration: interval('duration', { fields: 'hour to second' }),
+});
+```
+
+## JSON
+
+| 构造函数 | PG 类型 | TS 类型 | 说明 |
+| --- | --- | --- | --- |
+| `json()` | `json` | `unknown`，可用 `.$type<T>()` 收窄 | 保留原文本格式 |
+| `jsonb()` | `jsonb` | `unknown`，可用 `.$type<T>()` 收窄 | 二进制存储，支持索引与丰富操作符 |
+
+绝大多数场景选 `jsonb`。`.$type<T>()` 只影响 TypeScript 类型，不做运行时校验。
+
+```ts
+import { jsonb, pgTable } from 'drizzle-orm/pg-core';
+
+export const settings = pgTable('settings', {
+  prefs: jsonb('prefs').$type<{ theme: 'light' | 'dark'; pageSize: number }>(),
+  tags: jsonb('tags').$type<string[]>().default([]),
+});
+```
+
+## UUID
+
+`uuid()` 对应 PG `uuid`，TS 类型为 `string`。`.defaultRandom()` 生成数据库端默认值 `gen_random_uuid()`（PG 13+ 内置）。
+
+```ts
+import { pgTable, uuid } from 'drizzle-orm/pg-core';
+
+export const sessions = pgTable('sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+});
+```
+
+## 枚举：pgEnum
+
+PostgreSQL 的枚举是独立的数据库类型，用 `pgEnum` 声明后像列构造函数一样使用，迁移时会生成 `CREATE TYPE`。
+
+```ts
+import { pgEnum, pgTable, text } from 'drizzle-orm/pg-core';
+
+export const mood = pgEnum('mood', ['sad', 'ok', 'happy']);
+
+export const diary = pgTable('diary', {
+  today: mood('today').notNull(),
+  history: mood('history').array(), // 枚举数组
+});
+```
+
+```sql
+CREATE TYPE "mood" AS ENUM ('sad', 'ok', 'happy');
+```
+
+## 数组
+
+任意列构造函数都可链式调用 `.array()` 变成数组列，可选传入尺寸上限 `.array(n)`。TS 类型相应变为元素类型的数组。
+
+```ts
+import { integer, pgTable, text } from 'drizzle-orm/pg-core';
+
+export const posts = pgTable('posts', {
+  tags: text('tags').array().notNull(), // text[]
+  scores: integer('scores').array(3), // integer[3]
+});
+```
+
+## 几何、网络与向量
+
+| 构造函数 | PG 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `point()` | `point` | `[number, number]` 或 `{ x, y }` | `mode: 'tuple'` 或 `'xy'` |
+| `line()` | `line` | `[number, number, number]` 或 `{ a, b, c }` | `mode: 'tuple'` 或 `'abc'` |
+| `geometry()` | PostGIS `geometry` | 元组或 `{ x, y }` | `type`、`mode`、`srid` |
+| `inet()` | `inet` | `string` | IPv4/IPv6 主机地址 |
+| `cidr()` | `cidr` | `string` | 网段 |
+| `macaddr()` / `macaddr8()` | `macaddr` / `macaddr8` | `string` | MAC 地址 |
+
+`geometry()` 来自 PostGIS 扩展，需先启用扩展（见 [扩展](/docs/extensions)）：
+
+```ts
+import { geometry, pgTable, point } from 'drizzle-orm/pg-core';
+
+export const places = pgTable('places', {
+  location: point('location', { mode: 'xy' }), // { x: 1, y: 2 }
+  geo: geometry('geo', { type: 'point', mode: 'xy', srid: 4326 }),
+});
+```
+
+pgvector 扩展提供向量列（同样从 `drizzle-orm/pg-core` 导入，需先 `CREATE EXTENSION vector`）：
+
+| 构造函数 | PG 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `vector()` | `vector` | `number[]` | `dimensions` 必填 |
+| `halfvec()` | `halfvec` | `number[]` | `dimensions` 必填 |
+| `sparsevec()` | `sparsevec` | `string` | `dimensions` 必填 |
+| `bit()` | `bit`（pgvector 二进制向量） | `string` | `dimensions` 必填 |
+
+<Callout type="warn" title="bit 不是传统位串">
+这里的 `bit({ dimensions })` 是 pgvector 的二进制向量类型。传统 SQL 位串 `BIT(n)` / `BIT VARYING(n)` 没有专用构造函数，请用 [customType](/docs/custom-types) 映射。
+</Callout>
+
+## 类型收窄与运行时钩子
+
+- `.$type<T>()`：为 `json`/`jsonb`/`text` 等列标注更精确的 TS 类型，也可用于 branded 类型（如 `.$type<UserId>()`）。
+- `.$defaultFn(() => ...)`（别名 `$default()`）：插入时在应用端计算默认值，不写入数据库 DDL。
+- `.$onUpdateFn(() => ...)`（别名 `$onUpdate()`）：每次 update 时在应用端重算该列，同样不影响迁移。
+
+数据库端的默认值请用 `.default()` / `.defaultNow()` / `.defaultRandom()`；生成列见 [生成列](/docs/generated-columns)。
+
+## 接下来
+
+<Cards>
+  <Card title="MySQL 列类型" href="/docs/column-types-mysql" description="mysql-core 的整数、字符串、日期与枚举类型速查。" />
+  <Card title="SQLite 列类型" href="/docs/column-types-sqlite" description="存储类、mode 选项与无原生枚举/数组的替代方案。" />
+  <Card title="索引与约束" href="/docs/indexes-constraints" description="主键、外键、unique、check 与索引的完整用法。" />
+  <Card title="自定义类型" href="/docs/custom-types" description="用 customType 映射 Drizzle 未内置的数据库类型。" />
+</Cards>

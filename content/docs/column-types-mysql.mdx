@@ -1,0 +1,206 @@
+---
+title: MySQL 列类型
+description: drizzle-orm/mysql-core 列类型完整参考：整数与 unsigned、浮点与 decimal、字符串与 text 系列、二进制、日期时间、JSON、mysqlEnum 及 mode 选项。
+---
+
+所有 MySQL 列构造函数都从 `drizzle-orm/mysql-core` 导入。与 PostgreSQL 不同，MySQL 的整数有 `unsigned` 选项、字符串类型按长度细分、枚举直接内联在列上。本页按类别给出完整速查表；约束与索引见 [索引与约束](/docs/indexes-constraints)。
+
+```ts title="src/db/schema.ts"
+import { mysqlTable, serial, text, timestamp, varchar } from 'drizzle-orm/mysql-core';
+
+export const users = mysqlTable('users', {
+  id: serial('id').primaryKey(),
+  email: varchar('email', { length: 256 }).notNull(),
+  bio: text('bio'),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+```
+
+## 整数
+
+| 构造函数 | MySQL 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `tinyint()` | `tinyint` | `number` | `unsigned` |
+| `smallint()` | `smallint` | `number` | `unsigned` |
+| `mediumint()` | `mediumint` | `number` | `unsigned` |
+| `int()` | `int` | `number` | `unsigned` |
+| `bigint()` | `bigint` | 由 `mode` 决定 | `mode`、`unsigned` |
+| `serial()` | `serial` | `number` | 无（隐含自增与唯一） |
+
+`unsigned: true` 把范围翻倍（如 `int` 从约 ±21 亿变为 0–42 亿），默认有符号。`bigint` 必须显式指定 `mode`，可选 `'number'`、`'bigint'`、`'string'`；`serial` 是 `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE` 的别名。
+
+```ts
+import { bigint, int, mysqlTable, serial, tinyint } from 'drizzle-orm/mysql-core';
+
+export const stats = mysqlTable('stats', {
+  id: serial('id').primaryKey(),
+  hits: int('hits', { unsigned: true }).notNull().default(0),
+  balance: bigint('balance', { mode: 'bigint' }), // 完整 64 位
+  level: tinyint('level', { unsigned: true }),
+});
+```
+
+<Callout type="info" title="没有 zerofill 选项">
+Drizzle 的整数配置不提供 `zerofill`（MySQL 8.0.17 起已弃用显示宽度与 ZEROFILL）。如确有需要，用 [customType](/docs/custom-types) 自行映射，或在展示层补零。
+</Callout>
+
+## 浮点与精确小数
+
+| 构造函数 | MySQL 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `float()` | `float` | `number` | `precision`、`scale`、`unsigned` |
+| `double()` | `double` | `number` | `precision`、`scale`、`unsigned` |
+| `real()` | `real` | `number` | `precision`、`scale` |
+| `decimal()` | `decimal` | `string`（默认）、`number` 或 `bigint` | `precision`、`scale`、`mode`、`unsigned` |
+
+MySQL 中 `real` 默认是 `double` 的同义词（除非开启 `REAL_AS_FLOAT` SQL 模式）。`decimal` 的 `mode` 默认 `'string'`，金额场景保持字符串最安全。
+
+```ts
+import { decimal, double, mysqlTable } from 'drizzle-orm/mysql-core';
+
+export const products = mysqlTable('products', {
+  price: decimal('price', { precision: 10, scale: 2 }).notNull(), // string
+  rating: double('rating', { unsigned: true }),
+});
+```
+
+## 字符串与文本
+
+| 构造函数 | MySQL 类型 | 最大长度 | 选项 |
+| --- | --- | --- | --- |
+| `char()` | `char` | 255 字符 | `length`、`enum` |
+| `varchar()` | `varchar` | 65,535 字节（行内共享） | `length` 必填、`enum` |
+| `tinytext()` | `tinytext` | 255 字节 | `enum` |
+| `text()` | `text` | 64 KB | `enum` |
+| `mediumtext()` | `mediumtext` | 16 MB | `enum` |
+| `longtext()` | `longtext` | 4 GB | `enum` |
+
+`enum` 选项只收窄 TypeScript 类型为字面量联合，不做数据库或运行时校验；真正的取值约束用 `mysqlEnum`。`char` 定长补空格，`varchar` 变长，text 系列不能有默认值（MySQL 8.0.13+ 可用表达式默认值）。
+
+```ts
+import { char, mysqlTable, text, varchar } from 'drizzle-orm/mysql-core';
+
+export const articles = mysqlTable('articles', {
+  slug: varchar('slug', { length: 128 }).notNull(),
+  countryCode: char('country_code', { length: 2 }),
+  body: text('body'),
+  status: varchar('status', { length: 20, enum: ['draft', 'published'] }),
+});
+```
+
+## 二进制
+
+| 构造函数 | MySQL 类型 | 说明 |
+| --- | --- | --- |
+| `binary()` | `binary` | 定长字节串，`length` 默认 1 |
+| `varbinary()` | `varbinary` | 变长字节串，`length` 必填 |
+| `tinyblob()` | `tinyblob` | 最大 255 字节 |
+| `blob()` | `blob` | 最大 64 KB |
+| `mediumblob()` | `mediumblob` | 最大 16 MB |
+| `longblob()` | `longblob` | 最大 4 GB |
+
+```ts
+import { binary, mysqlTable, varbinary } from 'drizzle-orm/mysql-core';
+
+export const files = mysqlTable('files', {
+  hash: binary('hash', { length: 32 }).notNull(),
+  payload: varbinary('payload', { length: 1024 }),
+});
+```
+
+<Callout type="info" title="blob 系列的版本差异">
+`blob` / `tinyblob` / `mediumblob` / `longblob` 见于官方列类型文档，但部分 drizzle-orm 发行版未导出这些构造函数。若导入报错，可用 [customType](/docs/custom-types) 映射，或改用 `varbinary({ length })` / `text()`。
+</Callout>
+
+## 布尔
+
+`boolean()` 是 `tinyint(1)` 的别名，TS 类型为 `boolean`，驱动在 0/1 与布尔值之间转换。MySQL 没有原生布尔类型。
+
+```ts
+import { boolean, mysqlTable } from 'drizzle-orm/mysql-core';
+
+export const flags = mysqlTable('flags', {
+  enabled: boolean('enabled').notNull().default(true),
+});
+```
+
+## 日期与时间
+
+| 构造函数 | MySQL 类型 | TS 类型 | 选项 |
+| --- | --- | --- | --- |
+| `date()` | `date` | `Date`（默认）或 `string` | `mode: 'date'` 或 `'string'` |
+| `datetime()` | `datetime` | `Date`（默认）或 `string` | `mode`、`fsp`（0–6） |
+| `timestamp()` | `timestamp` | `Date`（默认）或 `string` | `mode`、`fsp`（0–6） |
+| `time()` | `time` | `string` | `fsp`（0–6） |
+| `year()` | `year` | `number` | 无 |
+
+`fsp` 是小数秒精度（fractional seconds precision）。`timestamp` 存储 UTC 并按会话时区转换，范围 1970–2038；`datetime` 不做时区转换，范围更大。`timestamp` 支持 `.defaultNow()`。
+
+```ts
+import { date, datetime, mysqlTable, time, timestamp, year } from 'drizzle-orm/mysql-core';
+
+export const events = mysqlTable('events', {
+  day: date('day', { mode: 'string' }), // '2025-01-01'
+  startsAt: datetime('starts_at', { fsp: 3 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  openTime: time('open_time'), // '09:30:00'
+  modelYear: year('model_year'),
+});
+```
+
+## JSON
+
+`json()` 对应 MySQL 原生 `json` 类型（5.7.8+），TS 类型默认 `unknown`，用 `.$type<T>()` 收窄。MySQL 会自动校验写入值是否为合法 JSON。
+
+```ts
+import { json, mysqlTable } from 'drizzle-orm/mysql-core';
+
+export const settings = mysqlTable('settings', {
+  prefs: json('prefs').$type<{ theme: 'light' | 'dark' }>(),
+});
+```
+
+## 枚举：mysqlEnum
+
+与 PG 的独立 `pgEnum` 类型不同，MySQL 枚举内联在列定义中，`mysqlEnum` 直接作为列构造函数使用，取值列表写在列上：
+
+```ts
+import { mysqlEnum, mysqlTable, varchar } from 'drizzle-orm/mysql-core';
+
+export const tickets = mysqlTable('tickets', {
+  status: mysqlEnum('status', ['open', 'in_progress', 'closed']).notNull().default('open'),
+  // 也可以先声明再复用（生成共享的枚举列构建器）
+  priority: mysqlEnum(['low', 'high'])('priority'),
+});
+```
+
+```sql
+`status` enum('open','in_progress','closed') NOT NULL DEFAULT 'open'
+```
+
+修改枚举取值列表会触发表级 `ALTER`，大表上代价较高；取值频繁变化时考虑 `varchar` 加 `check` 或字典表。
+
+<Callout type="warn" title="SET 类型没有专用构造函数">
+Drizzle 不提供 `mysqlSet`。MySQL 的 `SET` 类型请用 [customType](/docs/custom-types) 映射，或改为一组 `boolean` 列 / 关联表，后者更利于索引与查询。
+</Callout>
+
+## 自增与主键
+
+MySQL 用链式 `.autoincrement()` 声明自增（每表只能一列，且必须是键）；`serial()` 已隐含自增与唯一。复合主键与外键见 [索引与约束](/docs/indexes-constraints)。
+
+```ts
+import { int, mysqlTable } from 'drizzle-orm/mysql-core';
+
+export const posts = mysqlTable('posts', {
+  id: int('id').primaryKey().autoincrement(),
+});
+```
+
+## 接下来
+
+<Cards>
+  <Card title="PostgreSQL 列类型" href="/docs/column-types-postgres" description="pg-core 的完整类型速查与 mode 选项。" />
+  <Card title="SQLite 列类型" href="/docs/column-types-sqlite" description="存储类映射与 timestamp/boolean/json 模式。" />
+  <Card title="索引与约束" href="/docs/indexes-constraints" description="主键、外键、unique、check 与索引的完整用法。" />
+  <Card title="自定义类型" href="/docs/custom-types" description="用 customType 映射 SET、ZEROFILL 等未内置类型。" />
+</Cards>

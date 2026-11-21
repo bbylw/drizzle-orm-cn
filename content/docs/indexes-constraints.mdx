@@ -1,0 +1,201 @@
+---
+title: 索引与约束
+description: Drizzle 中主键、自增、notNull、default、unique、check、外键与索引的声明方式，覆盖 PostgreSQL、MySQL、SQLite 三种方言及迁移注意事项。
+---
+
+约束与索引在 Drizzle 中分两层声明：列级链式方法（`.notNull()`、`.unique()` 等）和表级第三参数回调（返回数组，放复合约束与索引）。三个方言的 API 形状一致，细节差异在下文标注。
+
+## 列级约束与默认值
+
+| 方法 | 作用 | 备注 |
+| --- | --- | --- |
+| `.notNull()` | `NOT NULL` | 插入类型中变为必填 |
+| `.default(value)` | 常量默认值 | 写入 DDL，如 `DEFAULT 'draft'` |
+| `.defaultNow()` | 当前时间默认值 | PG `timestamp`、MySQL `timestamp` 等 |
+| `.primaryKey()` | 单列主键 | 复合主键用表级 `primaryKey()` |
+| `.$defaultFn(fn)` | 应用端默认值 | 只在运行时执行，不写入 DDL |
+
+## 主键与自增
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+```ts
+import { integer, pgTable, primaryKey, serial } from 'drizzle-orm/pg-core';
+
+// serial 或 identity 自增
+export const a = pgTable('a', { id: serial('id').primaryKey() });
+export const b = pgTable('b', {
+  id: integer('id').generatedAlwaysAsIdentity().primaryKey(),
+});
+// 复合主键（表级）
+export const c = pgTable('c', {
+  bookId: integer('book_id').notNull(),
+  authorId: integer('author_id').notNull(),
+}, (t) => [primaryKey({ columns: [t.bookId, t.authorId] })]);
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```ts
+import { int, mysqlTable } from 'drizzle-orm/mysql-core';
+
+export const a = mysqlTable('a', {
+  id: int('id').primaryKey().autoincrement(), // 每表仅一列可自增
+});
+```
+
+</Tab>
+<Tab value="SQLite">
+
+```ts
+import { integer, sqliteTable } from 'drizzle-orm/sqlite-core';
+
+export const a = sqliteTable('a', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+});
+```
+
+</Tab>
+</Tabs>
+
+复合主键三方言写法一致：表级 `primaryKey({ columns: [t.bookId, t.authorId] })`，可加 `name: 'book_author_pk'` 自定义约束名。
+
+## unique：列级与复合
+
+```ts
+import { integer, pgTable, text, unique } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  email: text('email').notNull().unique(), // 自动命名
+  handle: text('handle').unique('users_handle_unique'), // 自定义名
+  tenantId: integer('tenant_id').notNull(),
+  seq: integer('seq').notNull(),
+}, (t) => [
+  unique('tenant_seq_unique').on(t.tenantId, t.seq), // 复合唯一
+]);
+```
+
+PG 15+ 可让多个 NULL 视为重复：列级 `.unique('name', { nulls: 'not distinct' })`，表级 `unique('name').on(...).nullsNotDistinct()`。MySQL / SQLite 无此选项。
+
+## check
+
+`check(name, sql)` 在表级声明检查约束，表达式用 `sql` 模板引用列：
+
+```ts
+import { sql } from 'drizzle-orm';
+import { check, integer, pgTable } from 'drizzle-orm/pg-core';
+
+export const accounts = pgTable('accounts', {
+  age: integer('age'),
+}, (t) => [check('age_check', sql`${t.age} > 21`)]);
+```
+
+## 外键
+
+列级 `.references(() => other.col, actions)` 最常用；`onDelete` / `onUpdate` 可选值：`'cascade'`、`'restrict'`、`'no action'`（默认）、`'set null'`、`'set default'`。
+
+```ts
+import { integer, pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', { id: serial('id').primaryKey() });
+
+export const posts = pgTable('posts', {
+  id: serial('id').primaryKey(),
+  authorId: integer('author_id').notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+});
+```
+
+复合外键用表级 `foreignKey({ columns: [...], foreignColumns: [...], name? })`。自引用（如员工表引用上级）需要显式返回类型打破循环推断：PG 用 `(): AnyPgColumn => users.managerId`，MySQL / SQLite 对应 `AnyMySqlColumn` / `AnySQLiteColumn`。
+
+## 索引
+
+表级 `index(name)` 与 `uniqueIndex(name)` 建普通/唯一索引，`.on()` 接收一列或多列（复合索引），列可链式 `.asc()` / `.desc()`：
+
+```ts
+import { index, pgTable, text, uniqueIndex } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  email: text('email').notNull(),
+  lastName: text('last_name'),
+  firstName: text('first_name'),
+}, (t) => [
+  uniqueIndex('email_idx').on(t.email),
+  index('name_idx').on(t.lastName, t.firstName.desc()), // 复合 + 降序
+]);
+```
+
+各方言的高级选项：
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+```ts
+import { sql } from 'drizzle-orm';
+import { index, pgTable, text } from 'drizzle-orm/pg-core';
+
+export const docs = pgTable('docs', {
+  title: text('title'),
+  body: text('body'),
+}, (t) => [
+  index('title_idx')
+    .on(t.title.asc().nullsFirst())
+    .concurrently() // 不阻塞写入（不能在事务块内执行）
+    .where(sql`${t.title} is not null`) // 部分索引
+    .with({ fillfactor: '70' }),
+  index('body_search_idx').using('gin', t.body), // 指定方法：btree/gin/gist 等
+  index('title_ops_idx').using('btree', t.title.op('text_ops')), // opclass
+]);
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```ts
+import { index, mysqlTable, varchar } from 'drizzle-orm/mysql-core';
+
+export const docs = mysqlTable('docs', {
+  title: varchar('title', { length: 256 }),
+}, (t) => [
+  index('title_idx')
+    .using('btree', t.title) // 'btree' 或 'hash'
+    .algorithm('inplace') // 'default' | 'inplace' | 'copy'
+    .lock('none'), // 'default' | 'none' | 'shared' | 'exclusive'；无 concurrently
+]);
+```
+
+</Tab>
+<Tab value="SQLite">
+
+```ts
+import { sql } from 'drizzle-orm';
+import { index, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+
+export const docs = sqliteTable('docs', {
+  title: text('title'),
+  status: text('status'),
+}, (t) => [
+  uniqueIndex('title_idx').on(t.title),
+  index('active_idx').on(t.title).where(sql`${t.status} = 'active'`), // 部分索引
+]);
+```
+
+SQLite 不支持 `using` / `concurrently`。
+
+</Tab>
+</Tabs>
+
+## 命名与迁移注意事项
+
+<Callout type="warn" title="显式命名，谨慎变更">
+复合约束与索引建议始终显式命名，否则 drizzle-kit 生成的自动名在重建表时可能变化，导致迁移反复 drop/create。`concurrently` 建索引不能包在事务里，drizzle-kit 迁移默认逐语句执行时需注意；大表加唯一约束前先用普通索引验证无重复数据。修改列类型或约束时，先检查既有数据是否满足新约束。
+</Callout>
+
+<Cards>
+  <Card title="Schema 与类型" href="/docs/schema" description="表定义、类型推导与约束的基础用法。" />
+  <Card title="迁移" href="/docs/migrations" description="用 drizzle-kit 生成并应用 schema 变更。" />
+  <Card title="生成列" href="/docs/generated-columns" description="generatedAlwaysAs 与 stored/virtual 模式。" />
+  <Card title="序列" href="/docs/sequences" description="PostgreSQL 序列的声明与管理。" />
+</Cards>

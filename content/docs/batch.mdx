@@ -1,0 +1,129 @@
+---
+title: Batch API
+description: db.batch 把多条语句打包成一次数据库调用：SQLite libSQL/Turso 与 Cloudflare D1、PostgreSQL Neon HTTP 的用法、返回类型与事务差异。
+---
+
+`db.batch()` 把多条查询打包进**一次数据库调用**，省去多次网络往返，特别适合 Serverless 与边缘环境。它不是通用能力，支持范围取决于驱动。本页示例假设已有 `db` 实例与 `users` 等表（见 [连接数据库](/docs/connections)）。
+
+## 哪些驱动支持
+
+| 方言 | 驱动 | 说明 |
+| --- | --- | --- |
+| SQLite | libSQL / Turso | batch 在隐式事务中按序执行 |
+| SQLite | Cloudflare D1 | 一次调用发送多条语句，降低网络延迟 |
+| PostgreSQL | Neon HTTP | 官方 PG batch 文档基于 Neon HTTP 驱动 |
+| MySQL | — | 官方未提供 batch API，请用[事务](/docs/transactions) |
+
+其他驱动（如 node-postgres、better-sqlite3）没有 `db.batch`，多语句原子性请使用事务。
+
+## 基本用法
+
+把查询构建器放进数组，**不要 await 单个查询**，整体 await `db.batch`：
+
+```ts
+import { eq } from 'drizzle-orm';
+
+const batchResponse = await db.batch([
+  db.insert(users).values({ id: 1, name: 'John' }).returning({ id: users.id }),
+  db.update(users).set({ name: 'Dan' }).where(eq(users.id, 1)),
+  db.query.users.findMany({}),
+  db.select().from(users).where(eq(users.id, 1)),
+  db.select({ id: users.id, invitedBy: users.invitedBy }).from(users),
+]);
+```
+
+## 类型安全的元组返回
+
+返回值是与输入一一对应的**元组**，每个位置的类型由对应查询推断：
+
+<Tabs items={['libSQL', 'D1', 'Neon HTTP']}>
+<Tab value="libSQL">
+
+```ts
+type BatchResponse = [
+  { id: number }[],          // insert ... returning
+  ResultSet,                 // update（驱动原始结果）
+  { id: number; name: string }[], // db.query.findMany
+  { id: number; name: string }[], // select
+  { id: number; invitedBy: number | null }[],
+];
+```
+
+</Tab>
+<Tab value="D1">
+
+```ts
+type BatchResponse = [
+  { id: number }[],
+  D1Result,                  // update（D1 原始结果）
+  { id: number; name: string }[],
+  { id: number; name: string }[],
+  { id: number; invitedBy: number | null }[],
+];
+```
+
+</Tab>
+<Tab value="Neon HTTP">
+
+```ts
+type BatchResponse = [
+  { id: number }[],
+  NeonHttpQueryResult,       // update（驱动原始结果）
+  { id: number; name: string }[],
+  { id: number; name: string }[],
+  { id: number; invitedBy: number | null }[],
+];
+```
+
+</Tab>
+</Tabs>
+
+解构即可拿到各自的结果：
+
+```ts
+const [inserted, , allUsers] = await db.batch([
+  db.insert(users).values({ name: 'John' }).returning(),
+  db.update(users).set({ name: 'Dan' }).where(eq(users.id, 1)),
+  db.select().from(users),
+]);
+```
+
+## 可以放进 batch 的构建器
+
+```ts
+db.query.<table>.findMany()
+db.query.<table>.findFirst()
+db.select()...
+db.insert()...
+db.update()...
+db.delete()...
+// SQLite 额外支持底层执行方法：
+db.all() / db.get() / db.values() / db.run() / db.execute()
+```
+
+## batch 与事务的区别
+
+<Callout type="info" title="libSQL：隐式事务">
+libSQL 的 batch 在一个隐式事务中按顺序执行：全部成功则提交，任一语句失败则整体回滚。因此在 Turso/libSQL 上，batch 同时提供了原子性与单次往返。
+</Callout>
+
+<Callout type="warn" title="D1：没有交互式事务">
+D1 的 HTTP 接口不支持交互式事务（`begin`/`commit` 跨请求），batch 是官方推荐的替代方案：多条语句一次发送、按序执行。但 batch 内无法根据前一条语句的结果做分支逻辑——需要这种控制流时，考虑 Durable Objects 或其他支持事务的部署形态。
+</Callout>
+
+与[事务](/docs/transactions)的对比：
+
+| 维度 | `db.batch` | `db.transaction` |
+| --- | --- | --- |
+| 网络往返 | 一次 | 多次（begin/语句/commit） |
+| 中途逻辑分支 | 不支持，语句预先构建 | 支持，可读取中间结果再决定 |
+| 回滚 | libSQL 自动；其他驱动依实现 | 抛错即回滚 |
+| 适用场景 | 固定的多语句组合、Serverless | 复杂业务流程、条件写入 |
+
+## 实践建议
+
+- 批量写入优先考虑 `insert().values([...])` 多行插入，一条语句即可，无需 batch。
+- batch 中的语句在调用前就全部构建完成，不能引用前一条的执行结果。
+- 语句数量与大小受驱动限制（如 D1 对单次 batch 的语句数与查询时长有上限），超大批量请分片。
+
+延伸阅读：[事务](/docs/transactions)、[性能优化](/docs/performance)、[Insert 写入](/docs/insert)。

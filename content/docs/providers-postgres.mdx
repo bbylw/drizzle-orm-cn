@@ -1,0 +1,201 @@
+---
+title: PostgreSQL 提供商
+description: Neon、Supabase、Vercel Postgres、Prisma Postgres、Xata、Nile、PlanetScale、Netlify 与 Appwrite 的接入代码与坑点。
+---
+
+托管 Postgres 的差异主要在**连接方式**（TCP/HTTP/WebSocket）、**环境变量**与**连接池模式**。本页按官方文档逐一给出初始化代码；通用驱动见 [PostgreSQL 驱动](/docs/drivers-postgres)。
+
+<Callout type="info" title="版本说明">
+代码与官方当前文档一致，`drizzle-orm@rc`（v1）与 0.x 稳定版均适用本页路径。连接串一律放环境变量，不要提交仓库。
+</Callout>
+
+## Neon
+
+环境变量：`DATABASE_URL`。边缘/serverless 用 HTTP 驱动，需要事务与会话用 WebSocket 驱动。
+
+<Tabs items={['HTTP（serverless）', 'WebSocket（事务）']}>
+<Tab value="HTTP（serverless）">
+
+```ts
+import { neon } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-http';
+
+const sql = neon(process.env.DATABASE_URL!);
+export const db = drizzle({ client: sql, schema });
+```
+
+</Tab>
+<Tab value="WebSocket（事务）">
+
+```ts
+import { Pool, neonConfig } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-serverless';
+import ws from 'ws';
+
+// Node.js 没有全局 WebSocket，需要 ws + bufferutil 包
+neonConfig.webSocketConstructor = ws;
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const db = drizzle({ client: pool, schema });
+```
+
+</Tab>
+</Tabs>
+
+<Callout type="warn" title="Neon HTTP 的事务限制">
+HTTP 驱动面向单条、非交互查询，**不支持交互式事务**（`db.transaction` 回调中按中间结果决策）。需要事务请改用 `drizzle-orm/neon-serverless`（WebSocket），或用 `db.batch()` 一次提交多条语句。Node.js 中 WebSocket 驱动需安装 `ws` 与 `bufferutil`。
+</Callout>
+
+## Supabase
+
+环境变量：`DATABASE_URL`。官方推荐 postgres.js 直连：
+
+```ts
+import postgres from 'postgres';
+import { drizzle } from 'drizzle-orm/postgres-js';
+
+const client = postgres(process.env.DATABASE_URL!);
+export const db = drizzle({ client, schema });
+```
+
+使用 Supabase **transaction 模式连接池**（端口 6543）时必须关闭预编译：
+
+```ts
+// Transaction pool mode 不支持 prepared statements
+const client = postgres(process.env.DATABASE_URL!, { prepare: false });
+```
+
+坑点：session 模式/直连（5432）才能用 prepared statements 与 `LISTEN/NOTIFY`；迁移建议走直连。
+
+## Vercel Postgres
+
+环境变量：Vercel 平台自动注入 `POSTGRES_URL` 等。官方驱动 `@vercel/postgres`：
+
+```ts
+import { sql } from '@vercel/postgres';
+import { drizzle } from 'drizzle-orm/vercel-postgres';
+
+export const db = drizzle({ client: sql, schema });
+// 在 Vercel 环境中可简写为 drizzle()，自动读取注入的环境变量
+```
+
+坑点：`@vercel/postgres` 走 HTTP/WebSocket，适合 Vercel Functions 与无 TCP 的边缘环境；长驻服务建议直接用 `postgres-js`/`node-postgres` 连接 `postgresql://` 串。
+
+## Prisma Postgres
+
+环境变量：`DATABASE_URL`（直连连接串）。官方目前用 node-postgres 或 postgres.js：
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+
+export const db = drizzle(process.env.DATABASE_URL!, { schema });
+```
+
+坑点：Prisma Postgres 的专用 serverless 驱动尚未被 Drizzle 支持（官方注明未来支持）；不要把它家 Accelerate 的 `prisma+postgres://` 协议串直接喂给 `pg`。
+
+## Xata
+
+环境变量：`DATABASE_URL`。新版 Xata 提供 Postgres 兼容接口，官方直接用 postgres.js：
+
+```ts
+import postgres from 'postgres';
+import { drizzle } from 'drizzle-orm/postgres-js';
+
+const client = postgres(process.env.DATABASE_URL!);
+export const db = drizzle({ client, schema });
+```
+
+坑点：旧版 Xata（HTTP API 时代）对应 `drizzle-orm/xata-http`，与新 Postgres 接口不是一回事，按你控制台给出的连接串选择驱动。
+
+## Nile
+
+环境变量：`NILEDB_URL`。Nile 是多租户 Postgres，用 node-postgres 连接：
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+
+export const db = drizzle(process.env.NILEDB_URL!, { schema });
+```
+
+租户隔离通过事务内设置 `nile.tenant_id` 实现，之后查询自动按租户过滤：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.transaction(async (tx) => {
+  await tx.execute(sql`set local nile.tenant_id = ${tenantId}`);
+  return tx.select().from(todos); // 无需 where 租户条件
+});
+```
+
+坑点：租户上下文是**事务级**的（`set local`），离开事务即失效，务必把业务查询包在同一事务里。
+
+## PlanetScale Postgres
+
+环境变量：`DATABASE_URL`。PlanetScale 的 Postgres 产品用 node-postgres 直连（注意 SSL）：
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+
+export const db = drizzle({
+  connection: { connectionString: process.env.DATABASE_URL, ssl: true },
+  schema,
+});
+```
+
+无 TCP 环境可复用 Neon 驱动，但要改端点：
+
+```ts
+import { neon, neonConfig } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-http';
+
+// PlanetScale Postgres 必需
+neonConfig.fetchEndpoint = (host) => `https://${host}/sql`;
+
+const sql = neon(process.env.DATABASE_URL!);
+export const db = drizzle({ client: sql, schema });
+```
+
+坑点：WebSocket 方式还需 `neonConfig.pipelineConnect = false` 与自定义 `wsProxy`，以官方示例为准；别把它与 [PlanetScale MySQL](/docs/drivers-mysql) 混淆。
+
+## Netlify Database
+
+环境变量：平台自动注入连接串，也可用 `DATABASE_URL`。驱动由 Netlify 团队维护：
+
+```ts
+import { drizzle } from 'drizzle-orm/netlify-db';
+
+export const db = drizzle({ schema }); // 自动读取平台连接配置
+```
+
+坑点：需要安装 `@netlify/database`；驱动由 Netlify 团队维护，只在 Netlify 平台环境内开箱即用。
+
+## Appwrite Postgres
+
+环境变量：`DATABASE_URL`（运行时，pooled）与 `DIRECT_URL`（迁移/内省，直连）：
+
+```bash title=".env"
+# 运行时：transaction 模式连接池，端口 6432
+DATABASE_URL="postgresql://admin:pass@db-hash.region.appwrite.center:6432/db?sslmode=require"
+# 迁移与 introspection：直连引擎，端口 5432
+DIRECT_URL="postgresql://admin:pass@db-hash.region.appwrite.center:5432/db?sslmode=require"
+```
+
+```ts
+import postgres from 'postgres';
+import { drizzle } from 'drizzle-orm/postgres-js';
+
+// transaction 池模式必须 prepare: false
+const client = postgres(process.env.DATABASE_URL!, { prepare: false });
+export const db = drizzle({ client, schema });
+```
+
+坑点：`drizzle.config.ts` 的 `dbCredentials.url` 要用 `DIRECT_URL`；连接串必须带 `sslmode=require`。
+
+## 下一步
+
+<Cards>
+  <Card title="PostgreSQL 驱动" href="/docs/drivers-postgres" description="pg、postgres.js、PGLite 等通用驱动" />
+  <Card title="事务" href="/docs/transactions" description="各驱动的事务能力差异" />
+  <Card title="连接数据库" href="/docs/connections" description="环境变量与连接池基础" />
+</Cards>

@@ -1,0 +1,127 @@
+---
+title: 别名
+description: 用 alias 给表起别名实现自连接，用 .as() 给列、子查询与 CTE 命名，让复杂查询保持可读。
+---
+
+SQL 中的别名（alias）用于给表、列或子查询起临时名字。Drizzle 提供 `alias()` 函数与 `.as()` 方法覆盖这些场景。本页示例假设已有 `db` 实例与相应 schema 表（见 [Schema 声明](/docs/schema)）。
+
+## 表别名：alias()
+
+`alias` 从各方言的 core 包导入（如 `drizzle-orm/pg-core`）。最典型的用途是**自连接**——同一张表以两个身份出现在查询中：
+
+```ts title="自连接：员工与经理"
+import { alias, pgTable, integer, text } from 'drizzle-orm/pg-core';
+import { eq } from 'drizzle-orm';
+
+export const employees = pgTable('employees', {
+  id: integer().primaryKey(),
+  name: text().notNull(),
+  managerId: integer('manager_id'),
+});
+
+// 给同一张表起别名 "manager"
+const manager = alias(employees, 'manager');
+
+const result = await db
+  .select({
+    employeeName: employees.name,
+    managerName: manager.name,
+  })
+  .from(employees)
+  .leftJoin(manager, eq(employees.managerId, manager.id));
+```
+
+```sql
+select "employees"."name", "manager"."name"
+from "employees"
+left join "employees" "manager" on "employees"."manager_id" = "manager"."id"
+```
+
+<Callout type="info" title="旧 API 提示">
+早期版本中该函数叫 `aliasedTable`，现行官方文档统一使用 `alias`。新代码请直接用 `alias`。
+</Callout>
+
+别名表在 `select`、`where`、`orderBy` 中都与原表一样使用，Drizzle 会自动生成带别名的标识符，避免列名歧义。
+
+## 列别名：.as()
+
+列与 SQL 表达式的 `.as()` 决定结果集中的字段名。在 `db.select({...})` 中对象 key 就是别名；而在子查询或 CTE 里，表达式必须显式 `.as()` 才能在外层被引用：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+const lowerName = sql<string>`lower(${users.name})`.as('lower_name');
+
+const sq = db.select({ lowerName }).from(users).as('sq');
+await db.select({ name: sq.lowerName }).from(sq);
+```
+
+## 子查询别名
+
+任何 `select` 查询加上 `.as('名字')` 就变成子查询，可以放进 `from` 或 join：
+
+```ts
+const sq = db.select().from(users).where(eq(users.id, 42)).as('sq');
+
+await db.select().from(sq);
+// select ... from (select ... from "users" where "id" = $1) "sq"
+```
+
+也可以 join 子查询：
+
+```ts
+import { isNotNull } from 'drizzle-orm';
+
+const activePosts = db.select().from(posts)
+  .where(isNotNull(posts.authorId)).as('active_posts');
+
+await db.select().from(users)
+  .leftJoin(activePosts, eq(activePosts.authorId, users.id));
+```
+
+<Callout type="warn" title="子查询必须命名">
+SQL 标准要求派生表必须有别名。忘记 `.as()` 会导致类型错误与 SQL 生成失败；子查询内的计算列同样需要 `.as()` 才能在外层引用。
+</Callout>
+
+## CTE：db.$with()
+
+公用表表达式（`WITH` 子句）用 `db.$with('名字').as(查询)` 定义，再通过 `db.with(...)` 使用：
+
+```ts
+const sq = db.$with('sq').as(
+  db.select().from(users).where(eq(users.id, 42)),
+);
+
+const result = await db.with(sq).select().from(sq);
+```
+
+```sql
+with "sq" as (select ... from "users" where "id" = $1)
+select ... from "sq"
+```
+
+CTE 中可以引用前面定义的 CTE，也可以一次传入多个：
+
+```ts
+const recentPosts = db.$with('recent_posts').as(
+  db.select().from(posts).orderBy(desc(posts.createdAt)).limit(10),
+);
+const authors = db.$with('authors').as(
+  db.select({ id: users.id, name: users.name })
+    .from(users)
+    .innerJoin(recentPosts, eq(recentPosts.authorId, users.id)),
+);
+
+await db.with(recentPosts, authors).select().from(authors);
+```
+
+## 如何选择
+
+| 场景 | 用法 |
+| --- | --- |
+| 同一张表 join 自己 | `alias(table, 'name')` |
+| 给表达式/列命名 | `expr.as('name')` |
+| `from` 一个查询结果 | `query.as('name')` |
+| 多步骤、可复用的中间结果 | `db.$with('name').as(query)` + `db.with(...)` |
+
+延伸阅读：[Join 查询](/docs/joins)、[Select 查询](/docs/select)、[sql`` 模板运算符](/docs/sql-operator)。

@@ -1,0 +1,214 @@
+---
+title: drizzle-kit 命令参考
+description: generate、migrate、push、pull、export、check、up、studio 八个命令的用途、flags、产物与使用时机。
+---
+
+本页是 `drizzle-kit` 各命令的完整参考。配置文件 `drizzle.config.ts` 的写法见 [drizzle-kit CLI](/docs/drizzle-kit)，迁移的整体工作流见 [迁移](/docs/migrations)，此处不重复。
+
+## 命令对照表
+
+| 命令 | 用途 | 需要连接数据库 | 产物 / 副作用 |
+| --- | --- | --- | --- |
+| `generate` | 由 schema 差异生成 SQL 迁移 | 否 | 迁移文件夹（SQL + snapshot） |
+| `migrate` | 执行尚未应用的迁移 | 是 | 数据库结构变更 + 迁移日志表 |
+| `push` | 直接把 schema 差异应用到数据库 | 是 | 数据库结构变更，无迁移文件 |
+| `pull` | 从数据库反向生成 Drizzle schema | 是 | `schema.ts` 等文件 |
+| `export` | 把 schema 导出为 SQL DDL 并打印 | 否 | 控制台输出 |
+| `check` | 检查迁移历史是否有冲突 | 否 | 检查结果（CI 用） |
+| `up` | 升级旧迁移的 snapshot 格式 | 否 | 就地更新 snapshot 文件 |
+| `studio` | 启动 Drizzle Studio 本地服务 | 是 | 本地 Web 服务 |
+
+旧文档中的 `introspect` 命令已并入 `pull`：官方现在统一使用 `drizzle-kit pull` 来表述「拉取（introspect）数据库 schema」。
+
+## 通用参数
+
+所有命令都支持通过配置文件或 CLI 传参，CLI 优先：
+
+```bash
+# 指定配置文件（多环境 / 多数据库时非常有用）
+bunx drizzle-kit push --config=drizzle-prod.config.ts
+
+# 完全不用配置文件，直接传参
+bunx drizzle-kit generate --dialect=postgresql --schema=./src/schema.ts
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--config` | 配置文件路径，默认 `drizzle.config.ts` |
+| `--dialect` | `postgresql` / `mysql` / `sqlite` / `turso` / `singlestore` / `mssql` / `cockroach` |
+| `--schema` | schema 文件或 glob 路径（`generate`、`push`、`export` 必需） |
+| `--out` | 迁移输出目录，默认 `./drizzle` |
+| `--url` | 数据库连接串（也可用 `--user` `--password` `--host` `--port` `--database`） |
+
+## generate
+
+读取 schema 文件生成 JSON 快照，与上一次快照对比，把差异写成 SQL 迁移。**不连接数据库**。
+
+```bash
+bunx drizzle-kit generate
+bunx drizzle-kit generate --name=add_posts
+bunx drizzle-kit generate --custom --name=seed_users
+```
+
+| Flag | 说明 |
+| --- | --- |
+| `--name` | 自定义迁移名（否则随机生成） |
+| `--custom` | 生成空 SQL 文件，供手写 DDL 或数据迁移 |
+| `--ignore-conflicts` | 跳过迁移交换性（commutativity）冲突检查，默认 `false` |
+
+产物是一个带时间戳的文件夹：
+
+```text
+drizzle/
+└── 20242409125510_add_posts/
+    ├── migration.sql
+    └── snapshot.json
+```
+
+何时用：每次修改 schema 后。生成的 SQL 要审查并提交到版本库。遇到重命名时 CLI 会交互式询问「是重命名还是删旧建新」。
+
+<Callout type="warn" title="关于 --ignore-conflicts">
+官方提示：如果你需要这个 flag，很可能是 drizzle-kit 的检查出了 bug，建议向官方反馈，而不是长期绕过检查。
+</Callout>
+
+## migrate
+
+读取迁移目录中的 SQL 文件，对比数据库中的迁移日志表，按顺序执行尚未应用的迁移，并写入日志。**需要 `dialect` 与数据库连接凭据**。
+
+```bash
+bunx drizzle-kit migrate
+bunx drizzle-kit migrate --config=drizzle-prod.config.ts
+```
+
+没有专属 CLI flag。迁移日志默认记录在 `drizzle` schema 下的 `__drizzle_migrations` 表，可在配置中自定义：
+
+```ts title="drizzle.config.ts"
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/schema.ts',
+  dbCredentials: { url: process.env.DATABASE_URL! },
+  migrations: {
+    table: '__drizzle_migrations', // 默认值
+    schema: 'drizzle', // 默认值
+  },
+});
+```
+
+何时用：测试与生产部署。也可以不用此命令，改用运行时的 `migrate()` 函数或外部工具（如 Bytebase）执行同一批 SQL 文件，见 [迁移进阶](/docs/migrations-advanced)。
+
+## push
+
+拉取数据库当前结构，与 schema 对比后直接应用差异。**不生成迁移文件、不写迁移历史**。
+
+```bash
+bunx drizzle-kit push
+bunx drizzle-kit push --force
+bunx drizzle-kit push --explain --verbose
+```
+
+| Flag | 说明 |
+| --- | --- |
+| `--force` | 自动接受所有可能导致数据丢失的语句（否则交互确认） |
+| `--verbose` | 执行前打印全部 SQL 语句 |
+| `--explain` | 只打印计划的变更，不实际执行（dry run） |
+
+可用 `tablesFilter`、`schemaFilter`、`extensionsFilters` 限定管理范围（配置项），例如忽略 PostGIS 扩展自建的表。
+
+何时用：本地原型与快速迭代。**不要用于生产发布**：没有可审查的 SQL，也没有历史记录。
+
+## pull
+
+从既有数据库拉取结构（即 introspect），生成 Drizzle schema 文件保存到 `out` 目录。适合 database-first 流程或接入他人维护的数据库。
+
+```bash
+bunx drizzle-kit pull
+bunx drizzle-kit pull --init
+bunx drizzle-kit pull --dialect=postgresql --url=postgresql://user:password@host:port/dbname
+```
+
+| Flag | 说明 |
+| --- | --- |
+| `--init` | 把拉取得到的 schema 标记为数据库中「已应用的初始迁移」，后续 `generate` 以它为基线做差异 |
+| `--introspect-casing` | 生成的 JS 键命名策略：`preserve`（保留原样）或 `camel`（驼峰） |
+
+同样支持 `tablesFilter`、`schemaFilter`、`extensionsFilters`。命名策略也可写在配置里：
+
+```ts title="drizzle.config.ts"
+export default defineConfig({
+  dialect: 'postgresql',
+  dbCredentials: { url: process.env.DATABASE_URL! },
+  introspect: { casing: 'camel' },
+});
+```
+
+何时用：接入已有数据库的第一步。之后把生成的文件纳入版本库，转入正常的 generate/migrate 流程。
+
+## export
+
+读取 schema 生成快照，输出对应的 SQL DDL 到**控制台**，不写文件、不连接数据库。
+
+```bash
+bunx drizzle-kit export
+bunx drizzle-kit export --sql=true
+```
+
+| Flag | 说明 |
+| --- | --- |
+| `--sql` | 输出 SQL 表示，默认即 SQL；未来可能支持其他格式 |
+
+何时用：把 DDL 交给外部迁移工具（如 Atlas）处理，或在 CI 中快速查看 schema 对应的建表语句。
+
+## check
+
+遍历所有已生成的迁移，检查历史中是否存在竞争条件（collision / 冲突）。多人多分支并行改 schema 时尤其重要，详见 [迁移进阶](/docs/migrations-advanced)。
+
+```bash
+bunx drizzle-kit check
+bunx drizzle-kit check --dialect=postgresql --out=./migrations-folder
+```
+
+| Flag | 说明 |
+| --- | --- |
+| `--ignore-conflicts` | 跳过交换性冲突检查（与 `generate` 的同名 flag 含义一致） |
+
+只需要 `dialect`（以及可选的 `out`），不连接数据库。何时用：合并分支后本地执行，以及作为 CI 的固定检查步骤。
+
+## up
+
+当 drizzle-kit 升级了内部 snapshot 格式（JSON 快照版本）时，用它把旧迁移的快照升级到新版本。
+
+```bash
+bunx drizzle-kit up
+bunx drizzle-kit up --dialect=postgresql --out=./migrations-folder
+```
+
+只需要 `dialect` 与可选的 `out`。何时用：跨大版本升级 drizzle-kit 后，按升级说明执行一次；平时不需要运行。
+
+## studio
+
+启动 Drizzle Studio 的本地代理服务，浏览器通过 `local.drizzle.studio` 访问。需要数据库连接凭据。
+
+```bash
+bunx drizzle-kit studio
+bunx drizzle-kit studio --port=3000
+bunx drizzle-kit studio --host=0.0.0.0 --port=3000
+bunx drizzle-kit studio --verbose
+```
+
+| Flag | 说明 |
+| --- | --- |
+| `--port` | 服务端口，默认 `4983` |
+| `--host` | 监听地址，默认 `127.0.0.1` |
+| `--verbose` | 输出详细日志 |
+
+何时用：开发期浏览与编辑数据。功能与安全注意事项见 [Drizzle Studio](/docs/studio)。
+
+## 下一步
+
+<Cards>
+  <Card title="drizzle-kit CLI" href="/docs/drizzle-kit" description="配置文件与安装脚本" />
+  <Card title="迁移" href="/docs/migrations" description="generate/migrate 工作流与破坏性变更" />
+  <Card title="迁移进阶" href="/docs/migrations-advanced" description="团队协作、web/mobile 与数据迁移" />
+</Cards>

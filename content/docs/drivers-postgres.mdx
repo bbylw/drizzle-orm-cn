@@ -1,0 +1,189 @@
+---
+title: PostgreSQL 驱动
+description: node-postgres、postgres.js、Bun SQL、PGLite、AWS Data API、Effect Postgres 与 HTTP proxy 的初始化代码与选型建议。
+---
+
+Drizzle 通过「驱动适配层」连接 PostgreSQL：你提供客户端，Drizzle 负责类型安全的查询构建。本页覆盖官方文档中的全部 PostgreSQL 驱动，托管提供商（Neon、Supabase 等）见 [PostgreSQL 提供商](/docs/providers-postgres)。
+
+<Callout type="info" title="版本说明">
+导入路径以官方当前文档为准。标注 **v1 RC** 的驱动需要 `drizzle-orm@rc`；未标注的驱动在 0.x 稳定版与 v1 中均可用。初始化统一使用 `drizzle({ client, schema })` 配置对象风格，官方也支持 `drizzle(url)` 简写。
+</Callout>
+
+## 驱动速览
+
+| 驱动 | 导入路径 | 适用场景 |
+| --- | --- | --- |
+| node-postgres | `drizzle-orm/node-postgres` | Node.js 长驻服务的默认选择 |
+| postgres.js | `drizzle-orm/postgres-js` | 轻量高性能，边缘与 serverless 友好 |
+| Bun SQL | `drizzle-orm/bun-sql` | Bun 运行时内置客户端，零依赖 |
+| PGLite | `drizzle-orm/pglite` | 浏览器/测试内嵌 WASM Postgres |
+| AWS Data API | `drizzle-orm/aws-data-api/pg` | Aurora/RDS Data API，HTTP 免 TCP |
+| Effect Postgres（v1 RC） | `drizzle-orm/effect-postgres` | Effect 生态，依赖注入与 Layer |
+| HTTP proxy | `drizzle-orm/pg-proxy` | 任意运行时经自建 HTTP 服务查库 |
+
+## node-postgres（pg）
+
+最成熟的 Node.js 驱动。直接传连接串，Drizzle 内部创建 `Pool`：
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from './schema';
+
+export const db = drizzle(process.env.DATABASE_URL!, { schema });
+```
+
+需要控制连接池时显式传入 `pg.Pool`：
+
+```ts
+import { Pool } from 'pg';
+import { drizzle } from 'drizzle-orm/node-postgres';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10, // 池上限，按数据库连接配额调整
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+  ssl: { rejectUnauthorized: true }, // 托管库通常要求 SSL
+});
+
+export const db = drizzle({ client: pool, schema });
+```
+
+脚本结束时调用 `await pool.end()`，避免进程挂起。
+
+## postgres.js
+
+更轻量的现代驱动，连接惰性建立，适合 serverless：
+
+```ts
+import postgres from 'postgres';
+import { drizzle } from 'drizzle-orm/postgres-js';
+
+const client = postgres(process.env.DATABASE_URL!, { max: 10 });
+export const db = drizzle({ client, schema });
+```
+
+<Callout type="warn" title="事务型连接池">
+经过 PgBouncer/Supabase pooler 的 **transaction 模式**时，必须设置 `prepare: false`，否则预编译语句会报错。详见 [提供商页](/docs/providers-postgres)。
+</Callout>
+
+## Bun SQL
+
+Bun 内置的 `SQL` 客户端，无需安装第三方驱动（PostgreSQL 方言）：
+
+```ts
+import { SQL } from 'bun';
+import { drizzle } from 'drizzle-orm/bun-sql';
+
+const client = new SQL(process.env.DATABASE_URL!);
+export const db = drizzle({ client, schema });
+```
+
+也可简写为 `drizzle(process.env.DATABASE_URL!)`。仅在 Bun 运行时可用；MySQL 方言请用 `drizzle-orm/bun-sql/mysql`，见 [MySQL 驱动](/docs/drivers-mysql)。
+
+## PGLite
+
+把 Postgres 编译成 WASM 跑在进程内，适合本地开发、单元测试与浏览器演示：
+
+```ts
+import { PGlite } from '@electric-sql/pglite';
+import { drizzle } from 'drizzle-orm/pglite';
+
+// 内存模式；传入 dataDir 可持久化到磁盘
+const client = new PGlite();
+export const db = drizzle({ client, schema });
+```
+
+持久化与简写形式：
+
+```ts
+const db = drizzle({ connection: { dataDir: './pgdata' }, schema });
+// 或 drizzle('./pgdata')
+```
+
+PGLite 是单连接嵌入式数据库，不适合多实例生产部署。
+
+## AWS Data API
+
+通过 RDS Data API 以 HTTP 访问 Aurora/RDS，无需 VPC 内 TCP 连接，Lambda 场景常用：
+
+```ts
+import { RDSDataClient } from '@aws-sdk/client-rds-data';
+import { drizzle } from 'drizzle-orm/aws-data-api/pg';
+
+const rdsClient = new RDSDataClient({ region: 'us-east-1' });
+
+export const db = drizzle({
+  client: rdsClient,
+  database: process.env.DATABASE!,
+  secretArn: process.env.SECRET_ARN!,
+  resourceArn: process.env.RESOURCE_ARN!,
+  schema,
+});
+```
+
+三个参数缺一不可：数据库名、Secrets Manager 凭据 ARN、集群 ARN。也可用 `drizzle({ connection: { database, secretArn, resourceArn } })` 让 Drizzle 自建客户端。
+
+## Effect Postgres（v1 RC）
+
+面向 Effect 生态，基于 `@effect/sql-pg`，查询返回 `Effect` 而非 Promise：
+
+```ts
+import * as PgDrizzle from 'drizzle-orm/effect-postgres';
+import { PgClient } from '@effect/sql-pg';
+import * as Effect from 'effect/Effect';
+import * as Redacted from 'effect/Redacted';
+import { sql } from 'drizzle-orm';
+
+const PgClientLive = PgClient.layer({
+  url: Redacted.make(process.env.DATABASE_URL!),
+  // 官方示例还覆盖了日期/时间类型解析器，把原始值交给 Drizzle 映射
+});
+
+const program = Effect.gen(function* () {
+  const db = yield* PgDrizzle.makeWithDefaults();
+  const result = yield* db.execute(sql`select 1 as id`);
+  console.log(result);
+});
+
+Effect.runPromise(program.pipe(Effect.provide(PgClientLive)));
+```
+
+需要关系查询时用 `PgDrizzle.make({ relations })` 并通过 `Effect.provide(PgDrizzle.DefaultServices)` 提供默认服务。
+
+## drizzle HTTP proxy
+
+`drizzle-orm/pg-proxy` 把构建好的 SQL 发给你自己的 HTTP 服务执行，适合无法直连数据库的运行时：
+
+```ts
+import { drizzle } from 'drizzle-orm/pg-proxy';
+
+const db = drizzle(async (sql, params, method) => {
+  const res = await fetch('https://api.example.com/query', {
+    method: 'POST',
+    body: JSON.stringify({ sql, params, method }),
+  });
+  return { rows: await res.json() };
+});
+```
+
+服务端用任意驱动执行并返回行数组；`method` 为 `all` 时应返回数组形式的行。
+
+<Callout type="error" title="安全警告">
+proxy 服务端等于把数据库暴露给 HTTP。务必鉴权、限制可执行的语句，切勿原样透传任意 SQL 到公网。
+</Callout>
+
+## 连接池、SSL 与 serverless
+
+- **长驻 Node 服务**：一个进程一个池，`max` 乘以实例数不得超过数据库连接上限。
+- **serverless 函数**：优先平台 pooler 或 HTTP 驱动（Neon HTTP、Data API），避免每次冷启动新建 TCP 池。
+- **SSL**：托管库几乎都要求 TLS；`pg` 用 `ssl: { rejectUnauthorized: true }` 并配置 CA，postgres.js 用 `ssl: 'require'`。
+- **边缘运行时**：Workers/Edge 无法 TCP，选 HTTP/WebSocket 驱动，见 [提供商页](/docs/providers-postgres)。
+
+## 下一步
+
+<Cards>
+  <Card title="PostgreSQL 提供商" href="/docs/providers-postgres" description="Neon、Supabase、Vercel 等托管库接入" />
+  <Card title="连接数据库" href="/docs/connections" description="环境变量、日志与连接基础" />
+  <Card title="事务" href="/docs/transactions" description="原子写入与回滚" />
+</Cards>

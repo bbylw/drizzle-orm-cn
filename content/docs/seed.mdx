@@ -1,0 +1,169 @@
+---
+title: Drizzle Seed
+description: 用 drizzle-seed 生成确定性、可复现的假数据：seed/reset、refine、关联数据、generators 与版本控制。
+---
+
+`drizzle-seed` 基于可设种子的伪随机数生成器（pRNG），为你的 Drizzle schema 生成**确定性**的假数据：同一个 seed 数字永远产出同一批数据。适合测试、本地开发与 bug 复现——团队成员共享一个 seed 数字就能拿到完全相同的数据集。
+
+## 安装与基本用法
+
+```bash
+bun add drizzle-seed
+```
+
+```ts
+import { pgTable, serial, text, integer } from 'drizzle-orm/pg-core';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { seed } from 'drizzle-seed';
+
+const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+});
+
+const db = drizzle(process.env.DATABASE_URL!);
+await seed(db, { users }); // 默认插入 10 行
+```
+
+`seed(db, schema)` 的第二个参数是要填充的表集合（可以只传部分表）。常用选项：
+
+```ts
+await seed(db, schema, { count: 1000 }); // 每张表 1000 行
+await seed(db, schema, { seed: 12345 }); // 换一个 seed 数字 = 换一批数据
+```
+
+## 重置数据库
+
+测试套件中常用 `reset` 清空相关表后重新填充：
+
+```ts
+import { reset } from 'drizzle-seed';
+import * as schema from './schema';
+
+await reset(db, schema);
+```
+
+不同方言策略不同：PostgreSQL 会生成 `TRUNCATE ... CASCADE`，确保所有表被清空。
+
+<Callout type="warn" title="reset 会清空数据">
+`reset` 只用于开发/测试数据库，绝不要指向生产连接。
+</Callout>
+
+## refine：定制生成逻辑
+
+`.refine` 回调接收全部 generator 函数（习惯命名为 `f`），按表返回定制规则：
+
+- `columns`：为某列指定 generator，或写 `false` 跳过该列（交给数据库默认值）。
+- `count`：该表的行数，覆盖全局 `count`。
+- `with`：为每个父行生成多少条关联子行（relational seed）。
+
+```ts
+await seed(db, schema).refine((f) => ({
+  users: {
+    count: 20,
+    columns: {
+      name: f.fullName(),
+      email: f.email(),
+    },
+    with: {
+      posts: 10, // 每个 user 生成 10 篇 posts（需 schema 中声明外键）
+    },
+  },
+}));
+```
+
+`with` 依赖表之间的引用关系（`references()`），drizzle-seed 会自动把子行挂到父行上。也可以给数量指定加权随机分布。
+
+更精细的例子——唯一 id 区间 + 自定义文案数组：
+
+```ts
+await seed(db, schema).refine((f) => ({
+  users: {
+    count: 5,
+    columns: {
+      id: f.int({ minValue: 10000, maxValue: 20000, isUnique: true }),
+    },
+  },
+  posts: {
+    count: 100,
+    columns: {
+      description: f.valuesFromArray({
+        values: ['今天天气不错', '发现一家好咖啡店', '重构完成，测试全绿'],
+      }),
+    },
+  },
+}));
+```
+
+### 加权随机 weightedRandom
+
+列值与 `with` 数量都支持按权重混合多个 generator：
+
+```ts
+await seed(db, schema).refine((f) => ({
+  orders: {
+    count: 5000,
+    columns: {
+      // 30% 概率 10–100，70% 概率 100–300
+      unitPrice: f.weightedRandom([
+        { weight: 0.3, value: f.int({ minValue: 10, maxValue: 100 }) },
+        { weight: 0.7, value: f.number({ minValue: 100, maxValue: 300, precision: 100 }) },
+      ]),
+    },
+  },
+}));
+```
+
+## Generators 概览
+
+在 `.refine` 回调中通过 `f.xxx()` 使用。多数 generator 支持 `isUnique`（唯一值）与 `arraySize`（生成数组）；数值类支持 `minValue` / `maxValue`。代表性列表：
+
+| 分类 | Generator |
+| --- | --- |
+| 数值 | `intPrimaryKey`（从 1 递增）、`int`、`number` |
+| 基础 | `boolean`、`string`、`default`（固定值）、`valuesFromArray`、`json` |
+| 日期时间 | `date`、`time`、`timestamp`、`datetime`、`year`、`interval` |
+| 标识符 | `uuid` |
+| 人物 | `firstName`、`lastName`、`fullName`、`email`（唯一）、`phoneNumber`、`jobTitle` |
+| 地点与公司 | `country`、`city`、`streetAddress`、`postcode`、`state`、`companyName` |
+| 文本 | `loremIpsum` |
+| 几何与网络 | `point`、`line`、`geometry`、`vector`、`inet`、`bitString` |
+
+完整参数见官方 seed-functions 文档。注意：`arraySize` 与 `isUnique` 同时使用时，唯一性作用于元素值而非数组整体。
+
+## 版本控制（versioning）
+
+generator 的静态数据源或生成逻辑变更时，drizzle-seed 会提升 API 版本，保证「同 seed 同输出」的承诺不被破坏。你可以升级库版本，同时用 `version` 选项锁定旧的输出：
+
+```ts
+await seed(db, schema, { version: '2' }); // 沿用 v2 的生成行为
+```
+
+| API 版本 | npm 版本 | 变更的 generator |
+| --- | --- | --- |
+| v1 | 0.1.1 | 初始版本 |
+| v2 | 0.2.1 | `string()`、`interval({ isUnique: true })` |
+| v3 | 0.4.0 | hash 生成函数 |
+| v4（LTS） | 1.0.0-beta.8 | `uuid` |
+
+典型场景：测试依赖某批确定性数据，先固定 `version`，再逐步迁移到最新 generator。schema 变更（加表、加列）本身不需要动 version——只有 generator 行为变化才涉及。
+
+## 与手写 insert seed 的取舍
+
+| 维度 | drizzle-seed | 手写 `db.insert()` |
+| --- | --- | --- |
+| 数据量 | 一行代码生成上千行 | 逐条编写，量大时繁琐 |
+| 确定性 | 同 seed 完全可复现 | 天然确定 |
+| 真实感 | 内置人名、邮箱、地址等 | 需要自己编造 |
+| 精确控制 | 通过 refine 定制 | 完全控制每个值 |
+| 适用 | 开发/测试/演示数据 | 少量固定的基准数据（如初始管理员、字典表） |
+
+两者可以混用：固定的基准数据用手写 insert（或 [自定义迁移](/docs/migrations-advanced)），大批量业务数据用 drizzle-seed。
+
+## 下一步
+
+<Cards>
+  <Card title="迁移进阶" href="/docs/migrations-advanced" description="数据迁移与自定义 SQL" />
+  <Card title="Schema 与类型" href="/docs/schema" description="外键与引用关系是 relational seed 的基础" />
+  <Card title="drizzle-kit 命令参考" href="/docs/kit-commands" description="generate --custom 生成空迁移" />
+</Cards>

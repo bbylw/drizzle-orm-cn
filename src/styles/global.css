@@ -322,6 +322,13 @@ html > body[data-scroll-locked] {
   line-height: 1.85;
 }
 
+/* 小屏表格保持列宽，靠外层 overflow-auto 横向滚动，避免表头竖排 */
+@media (max-width: 640px) {
+  #nd-page table {
+    min-width: 560px;
+  }
+}
+
 #nd-sidebar {
   background: #0a0b0b;
 }

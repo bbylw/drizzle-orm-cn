@@ -1,0 +1,122 @@
+---
+title: 查询工具
+description: db.$count 统计行数、作为关联子查询嵌入 select 与关系查询，以及 exists 等相关辅助能力的用法。
+---
+
+Drizzle 提供一组查询辅助 API，把常见的「计数」「存在性判断」等模式封装成类型安全的调用。本页示例假设已有 `db` 实例与 `users`、`posts`、`comments` 表（见 [Schema 声明](/docs/schema)）。
+
+## $count：统计行数
+
+`db.$count()` 生成 `select count(*)` 查询，直接 await 得到数字：
+
+```ts
+// 全表计数
+const count = await db.$count(users);
+// select count(*) from "users"
+
+// 带过滤条件
+const count = await db.$count(users, eq(users.name, 'Dan'));
+// select count(*) from "users" where "users"."name" = $1
+```
+
+第二个参数接受与 `.where()` 相同的条件表达式，可以组合 `and`、`or` 等[运算符](/docs/operators)。
+
+## 作为子查询嵌入 select
+
+`db.$count()` 返回的是一个查询构建器，不 await 时可以直接放进 `select` 字段，生成关联子查询——一次查询拿到每行及其计数，避免 N+1：
+
+```ts
+const usersWithPostCount = await db.select({
+  id: users.id,
+  name: users.name,
+  postsCount: db.$count(posts, eq(posts.authorId, users.id)),
+}).from(users);
+```
+
+```sql
+select "users"."id", "users"."name",
+  (select count(*) from "posts" where "posts"."author_id" = "users"."id") as "postsCount"
+from "users"
+```
+
+## 在关系查询中使用
+
+配合 `db.query` 的 `extras`，把计数作为附加字段挂在结果对象上。注意 v2 关系查询中引用外层表列必须通过回调参数：
+
+```ts
+const result = await db.query.users.findMany({
+  with: { posts: true },
+  extras: {
+    postsCount: (t) => db.$count(posts, eq(posts.authorId, t.id)),
+  },
+});
+// [{ id, name, postsCount: number, posts: [...] }]
+```
+
+<Callout type="warn" title="extras 中不支持聚合">
+关系查询不会生成 `group by`，因此 `extras` 里不能直接写 `count(*)`、`sum(...)` 这类对本表行的聚合。要统计关联行数，用 `db.$count()` 子查询；要分组聚合，请用[查询构建器](/docs/select)。
+</Callout>
+
+## exists：存在性判断
+
+`exists()` 是[条件运算符](/docs/operators)之一（官方 Query utils 页只收录 `$count`），用于「只取存在关联行的记录」，通常比 `count(*) > 0` 更高效——数据库找到第一行即可停止：
+
+```ts
+import { exists, eq } from 'drizzle-orm';
+
+// 至少发过一篇文章的用户
+await db.select().from(users).where(
+  exists(db.select().from(posts).where(eq(posts.authorId, users.id))),
+);
+```
+
+```sql
+select ... from "users"
+where exists (select ... from "posts" where "posts"."author_id" = "users"."id")
+```
+
+配合 `notExists()` 取反：
+
+```ts
+import { notExists } from 'drizzle-orm';
+
+// 从未发过文章的用户
+await db.select().from(users).where(
+  notExists(db.select().from(posts).where(eq(posts.authorId, users.id))),
+);
+```
+
+在 v2 关系查询里，同样的语义有更简洁的对象写法：
+
+```ts
+// where 中按关系过滤：posts: true 表示「至少有一条 post」
+await db.query.users.findMany({
+  with: { posts: true },
+  where: { posts: true },
+});
+```
+
+## 手写聚合的替代方案
+
+`$count` 之外的聚合（`sum`、`avg`、`max` 等）用 `sql` 模板或内置聚合函数：
+
+```ts
+import { avg, count, sql } from 'drizzle-orm';
+
+await db.select({
+  total: count(),
+  avgId: avg(users.id),
+  custom: sql<number>`count(*) filter (where ${users.name} is not null)`,
+}).from(users);
+```
+
+## 小结
+
+| 需求 | 推荐 API |
+| --- | --- |
+| 单独取一个计数 | `await db.$count(table, cond?)` |
+| 每行附带关联计数 | `select` 字段或 `extras` 中放 `db.$count(...)` |
+| 按「是否存在关联」过滤 | `exists()` / `notExists()`，或 RQB `where: { rel: true }` |
+| 其他聚合 | `count` / `avg` / `sum` 等函数或 `sql` 模板 |
+
+延伸阅读：[条件运算符](/docs/operators)、[关联查询](/docs/relations)、[sql`` 模板运算符](/docs/sql-operator)。

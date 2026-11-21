@@ -1,0 +1,124 @@
+---
+title: 升级到 Drizzle v1
+description: v0 到 v1（beta/RC）的主要变化、升级步骤、迁移历史转换与回滚建议。
+---
+
+Drizzle v1 是一次大版本演进：drizzle-kit 全面重写、迁移文件夹改为 v3 结构、Relational Queries v1 被移除。本页依据官方 `/docs/upgrade-v1` 与 `/docs/pg/v0-v1-changes` 整理。
+
+<Callout type="error" title="beta/RC 风险提示">
+撰写本文时 npm `latest` 仍是 0.x 稳定版，v1 通过 `drizzle-orm@rc` / `drizzle-kit@rc` 发布。RC 仍可能出现破坏性调整：生产升级前锁定确切版本号、在 staging 完整演练，并持续关注官方 changelog。保守团队可等待正式版。
+</Callout>
+
+## 主要变化一览
+
+- **drizzle-kit 重写**：从数据库快照改为 DDL 快照，内省从约 10 秒降到 1 秒内；加载器从 esbuild-register 换成 tsx，配置文件支持顶层 `await`。
+- **迁移文件夹 v3**：每个迁移一个文件夹（`migration.sql` + `snapshot.json`），删除共享的 `meta/_journal.json`，减少 Git 冲突；`drizzle-kit drop` 命令被移除。
+- **RQB v1 移除**：关系查询必须迁移到 v2 的 `defineRelations()` API。
+- **casing API 重构**：`drizzle({ casing: 'camelCase' })` 被表级 `snakeCase.table` / `camelCase.table` 取代。
+- **校验包并入主包**：`drizzle-zod` → `drizzle-orm/zod`，valibot/typebox/arktype 同理，新增 `drizzle-orm/effect-schema`；旧包仍可用但新特性只进主包。
+- **`schemaFilter` 默认值变化**：`push`/`pull` 默认管理所有 schema（0.x 仅 `public`），支持 glob。
+- **`push --strict` 移除**：严格模式成为默认，数据丢失语句必须确认，`--force` 跳过；新增 `--explain` 预览 SQL。
+- **读副本路由**：`withReplicas()` 默认走主库，读副本需显式 `db.$replica`。
+- **错误信息**：`DrizzleQueryError` 默认不再带查询参数，需要时配置 `paramsInErrors: true`。
+- **其他**：`.array('[][]')` 替代链式 `.array().array()`；`pgTable.withRLS()` 替代 `.enableRLS()`；`generatedAlwaysAs()` 只接受 `sql`；`getTableColumns` → `getColumns`；新增 MSSQL/CockroachDB 方言与 Netlify、Effect、Turso 新驱动。
+
+驱动导入路径（如 `drizzle-orm/node-postgres`）保持兼容，v1 主要是**新增**子路径而非改名。
+
+## 升级步骤
+
+<Steps>
+<Step>
+
+### 备份
+
+备份数据库与整个迁移目录（含 `meta/_journal.json`），在独立分支上操作。转换历史前这一步不可省略。
+
+</Step>
+<Step>
+
+### 更新包
+
+```bash
+npm i drizzle-orm@rc
+npm i -D drizzle-kit@rc
+```
+
+两个包必须一起升级，不要混用 0.x kit 与 v1 ORM。
+
+</Step>
+<Step>
+
+### 转换迁移文件
+
+```bash
+npx drizzle-kit up
+```
+
+`up` 只改本地文件、不动数据库：每个迁移变成独立文件夹，SQL 原样保留，快照转为 DDL 格式，`meta/_journal.json` 被移除。PostgreSQL 快照同时升级到 format 9，**保留完整快照链**。若报告缺失 SQL/快照，从 Git 恢复，而不是删除已应用的迁移。
+
+</Step>
+<Step>
+
+### 更新应用代码
+
+按上方清单处理破坏性变更。关系查询迁移到 v2：
+
+```ts
+import { defineRelations } from 'drizzle-orm';
+import * as schema from './schema';
+
+export const relations = defineRelations(schema, (r) => ({
+  users: {
+    posts: r.many.posts(),
+  },
+  posts: {
+    author: r.one.users({
+      from: r.posts.authorId,
+      to: r.users.id,
+    }),
+  },
+}));
+```
+
+v2 过滤条件拒绝显式 `undefined`：省略字段或用 `drizzle-orm/relations` 的 `EmptyFilter`；`posts: true` 要求存在关联行，`posts: false` 要求不存在。
+
+</Step>
+<Step>
+
+### 校验迁移历史
+
+```bash
+npx drizzle-kit check
+```
+
+审查 Git diff：每个旧迁移都应有转换后的文件夹且 SQL 未变。`check` 还会检测跨分支的**不可交换迁移**（如一个分支重命名表、另一个分支修改它）。它只校验本地历史，不校验数据库已应用记录。发现冲突先解决再迁移。
+
+</Step>
+<Step>
+
+### 执行迁移
+
+```bash
+npx drizzle-kit migrate
+```
+
+首次运行会升级迁移历史表：新增 `name`（完整文件夹名）与 `applied_at` 列，旧记录按时间戳/哈希匹配回填（`applied_at` 为 `NULL`）。已应用迁移**不会重复执行**；随后所有本地缺失的迁移都会被补应用，无论时间戳先后。若有历史记录匹配不上，升级会停止——恢复对应本地迁移，而不是删历史或重建初始迁移。
+
+</Step>
+</Steps>
+
+## 回滚与并行期建议
+
+- **先 staging 后生产**：在数据库副本上完整走一遍 `up` → `check` → `migrate`，确认旧迁移未重跑、只有预期增量被执行。
+- **保留回退路径**：v1 改变了磁盘上的迁移格式与数据库历史表结构。回滚 = 恢复升级前的迁移目录备份 + 重装 0.x 包；历史表新增列对 0.x 无害，但文件夹结构必须还原。
+- **并行期冻结迁移生成**：升级窗口内不要同时用两个版本的 kit 生成迁移；团队统一切换时间点，避免 v3 与旧格式混杂。
+- **锁定版本**：RC 阶段用精确版本（如 `1.0.0-rc.x`）而非浮动标签，升级前阅读对应 release notes。
+- **文件夹名即身份**：v1 按完整文件夹名匹配迁移，升级后保持文件夹名稳定，重命名等于新迁移。
+
+## 下一步
+
+<Cards>
+  <Card title="迁移" href="/docs/migrations" description="迁移工作流基础" />
+  <Card title="Drizzle Kit" href="/docs/drizzle-kit" description="命令与配置参考" />
+  <Card title="已有项目接入" href="/docs/existing-project" description="pull 与基线做法" />
+</Cards>

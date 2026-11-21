@@ -1,0 +1,177 @@
+---
+title: 其他校验集成
+description: valibot、TypeBox、ArkType、Effect Schema 与 Drizzle 的集成：包名、createSchema 函数与 insert 校验示例。
+---
+
+除 [Zod](/docs/zod) 外，Drizzle 官方还为 valibot、TypeBox、ArkType 与 Effect Schema 提供集成。模式完全一致：`createInsertSchema` / `createSelectSchema` / `createUpdateSchema` 把表定义转换成对应库的 schema，refine 规则也相同——**传回调是扩展，直接传 schema 是覆盖**。
+
+## 包名与入口对照
+
+官方最新文档中，这些集成已内置为 `drizzle-orm` 的子路径（随 v1 提供，当前安装 `drizzle-orm@rc`）；v0.x 项目使用对应的独立包，函数名相同。
+
+| 库 | v1 内置子路径 | v0 独立包 | 校验入口 |
+| --- | --- | --- | --- |
+| valibot | `drizzle-orm/valibot` | `drizzle-valibot` | `parse(schema, data)` |
+| TypeBox | `drizzle-orm/typebox`（配 `typebox` 包） | `drizzle-typebox`（配 `@sinclair/typebox`） | `Value.Check` / `Value.Parse` |
+| ArkType | `drizzle-orm/arktype` | `drizzle-arktype` | 直接调用 `schema(data)`，失败返回 `ArkErrors` |
+| Effect Schema | `drizzle-orm/effect-schema` | — | `Schema.decodeUnknownEffect` |
+
+四个集成都支持表、视图与枚举的 select schema，以及表的 insert/update schema。
+
+<Tabs items={['valibot', 'TypeBox', 'ArkType', 'Effect Schema']}>
+<Tab value="valibot">
+
+```bash
+bun add drizzle-orm@rc valibot
+```
+
+```ts
+import { pgTable, text, integer } from 'drizzle-orm/pg-core';
+import { createInsertSchema } from 'drizzle-orm/valibot';
+import { parse, pipe, maxLength } from 'valibot';
+
+const users = pgTable('users', {
+  id: integer().generatedAlwaysAsIdentity().primaryKey(),
+  name: text().notNull(),
+  age: integer().notNull(),
+});
+
+const userInsertSchema = createInsertSchema(users, {
+  name: (schema) => pipe(schema, maxLength(20)), // 扩展默认规则
+});
+
+const parsed = parse(userInsertSchema, { name: 'Jane', age: 30 });
+await db.insert(users).values(parsed);
+```
+
+</Tab>
+<Tab value="TypeBox">
+
+```bash
+bun add drizzle-orm@rc typebox
+```
+
+```ts
+import { pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+import { createInsertSchema } from 'drizzle-orm/typebox';
+import { Type } from 'typebox';
+import { Value } from 'typebox/value';
+
+const users = pgTable('users', {
+  id: serial().primaryKey(),
+  name: text().notNull(),
+  email: text().notNull(),
+  role: text({ enum: ['admin', 'user'] }).notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+const insertUserSchema = createInsertSchema(users, {
+  id: (schema) => Type.Number({ ...schema, minimum: 0 }), // 扩展
+  role: Type.String(), // 覆盖
+});
+
+const isValid: boolean = Value.Check(insertUserSchema, {
+  name: 'John Doe',
+  email: 'johndoe@test.com',
+  role: 'admin',
+});
+```
+
+</Tab>
+<Tab value="ArkType">
+
+```bash
+bun add drizzle-orm@rc arktype
+```
+
+```ts
+import { pgTable, text, integer } from 'drizzle-orm/pg-core';
+import { createInsertSchema } from 'drizzle-orm/arktype';
+import { ArkErrors } from 'arktype';
+
+const users = pgTable('users', {
+  id: integer().generatedAlwaysAsIdentity().primaryKey(),
+  name: text().notNull(),
+  age: integer().notNull(),
+});
+
+const userInsertSchema = createInsertSchema(users, {
+  name: (schema) => schema.atMostLength(20), // 扩展
+});
+
+// ArkType 的 schema 是可直接调用的函数
+const parsed = userInsertSchema({ name: 'Jane', age: 30 });
+if (parsed instanceof ArkErrors) {
+  console.error(parsed.summary);
+} else {
+  await db.insert(users).values(parsed);
+}
+```
+
+</Tab>
+<Tab value="Effect Schema">
+
+```bash
+bun add drizzle-orm@rc effect
+```
+
+```ts
+import { pgTable, serial, text } from 'drizzle-orm/pg-core';
+import { createInsertSchema } from 'drizzle-orm/effect-schema';
+import { Effect, Schema } from 'effect';
+
+const users = pgTable('users', {
+  id: serial().primaryKey(),
+  name: text().notNull(),
+  email: text().notNull(),
+  role: text({ enum: ['admin', 'user'] }).notNull(),
+});
+
+const UserInsert = createInsertSchema(users, {
+  id: (schema) => schema.check(Schema.isGreaterThanOrEqualTo(0)), // 扩展
+  role: Schema.String, // 覆盖
+});
+
+const program = Effect.gen(function* () {
+  const parsedUser = yield* Schema.decodeUnknownEffect(UserInsert)({
+    name: 'John Doe',
+    email: 'johndoe@test.com',
+    role: 'admin',
+  });
+  // 校验通过后写库
+});
+```
+
+</Tab>
+</Tabs>
+
+## refine 规则速记
+
+第二个参数是一个「列名 → 规则」的对象，四个库语义一致：
+
+- `(schema) => ...`：在默认生成的 schema 上**扩展**，发生在列变为 nullable/optional 之前。
+- 直接给一个该库的 schema：**覆盖**整列规则，包括可空性。
+
+例如 valibot 中 `preferences: object({ theme: string() })` 会完全替换 `json` 列的默认宽松校验。
+
+## TypeBox 新旧版本
+
+TypeBox 生态有两个包名：新版 `typebox` 与旧版 `@sinclair/typebox`。官方对应提供两个子路径：
+
+| 子路径 | 搭配的包 | 说明 |
+| --- | --- | --- |
+| `drizzle-orm/typebox` | `typebox` | 当前推荐 |
+| `drizzle-orm/typebox-legacy` | `@sinclair/typebox` | 旧项目兼容，`Value.Parse` 等用法一致 |
+
+v0.x 的 `drizzle-typebox` 独立包搭配 `@sinclair/typebox` 使用。
+
+<Callout type="info" title="如何选择">
+已有技术栈优先：用 valibot 追求 bundle 体积、用 Effect 做函数式错误处理、用 ArkType 喜欢类型即校验的写法。没有历史包袱时，Zod 生态最成熟，见 [Zod 校验](/docs/zod)。
+</Callout>
+
+## 下一步
+
+<Cards>
+  <Card title="Zod 校验" href="/docs/zod" description="drizzle-zod 与内置 drizzle-orm/zod 详解" />
+  <Card title="Schema 与类型" href="/docs/schema" description="列类型到校验规则的映射基础" />
+</Cards>

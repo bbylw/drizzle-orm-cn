@@ -1,0 +1,186 @@
+---
+title: 视图（Views）
+description: 用 pgView、mysqlView、sqliteView 声明视图，掌握 PostgreSQL 物化视图的刷新与既有视图的迁移行为。
+---
+
+视图把一段查询固化为数据库对象，之后可以像表一样查询它。Drizzle 三个方言都支持视图声明：`pgView`、`mysqlView`、`sqliteView`，PostgreSQL 额外支持物化视图 `pgMaterializedView`。视图定义写在 schema 文件里，`drizzle-kit` 会生成对应的 `CREATE VIEW` 迁移。
+
+## 用 query builder 声明视图
+
+最常用的方式是 `.as((qb) => ...)`：列结构会**自动从查询推导**，无需手写。
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+```ts title="src/db/schema.ts"
+import { eq, sql } from 'drizzle-orm';
+import { integer, pgTable, pgView, serial, text } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull(),
+  cityId: integer('city_id'),
+});
+
+// 列结构自动推导
+export const usersView = pgView('users_view').as((qb) =>
+  qb.select().from(users),
+);
+
+// 也可以只暴露部分列、加过滤条件
+export const activeUsers = pgView('active_users').as((qb) =>
+  qb.select({ id: users.id, name: users.name })
+    .from(users)
+    .where(sql`${users.cityId} is not null`),
+);
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```ts title="src/db/schema.ts"
+import { eq } from 'drizzle-orm';
+import { int, mysqlTable, mysqlView, text } from 'drizzle-orm/mysql-core';
+
+export const users = mysqlTable('users', {
+  id: int('id').primaryKey().autoincrement(),
+  name: text('name'),
+  role: text('role').$type<'admin' | 'customer'>(),
+});
+
+export const customersView = mysqlView('customers_view').as((qb) =>
+  qb.select().from(users).where(eq(users.role, 'customer')),
+);
+```
+
+生成的 SQL 形如 `CREATE ALGORITHM = undefined SQL SECURITY definer VIEW ...`，可用 `.algorithm('merge')` 与 `.sqlSecurity('invoker')` 调整。
+
+</Tab>
+<Tab value="SQLite">
+
+```ts title="src/db/schema.ts"
+import { eq } from 'drizzle-orm';
+import { integer, sqliteTable, sqliteView, text } from 'drizzle-orm/sqlite-core';
+
+export const users = sqliteTable('users', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name'),
+  role: text('role').$type<'admin' | 'customer'>(),
+});
+
+export const customersView = sqliteView('customers_view').as((qb) =>
+  qb.select().from(users).where(eq(users.role, 'customer')),
+);
+```
+
+SQLite 视图是只读的，且不支持物化视图。
+
+</Tab>
+</Tabs>
+
+三个方言都可以改用独立的 `QueryBuilder`（从各自的 core 包导入），效果完全相同：
+
+```ts
+import { QueryBuilder, pgView } from 'drizzle-orm/pg-core';
+
+const qb = new QueryBuilder();
+export const usersView = pgView('users_view').as(qb.select().from(users));
+```
+
+## 查询视图
+
+视图声明导出后，用法与表一致，支持 where、join、分页等：
+
+```ts
+import { eq } from 'drizzle-orm';
+
+const result = await db.select().from(activeUsers).where(eq(activeUsers.id, 1));
+```
+
+<Callout type="info" title="视图定义里的参数会被内联">
+`.as()` 中的查询在生成 DDL 时会把参数**内联为字面量**（如 `where city_id = 1`），而不是 `$1` 占位符——视图定义必须是确定的 SQL。查询视图本身时参数仍正常走占位符。
+</Callout>
+
+## 用原生 SQL 声明视图
+
+query builder 覆盖不了的语法（窗口函数细节、方言特有表达式等）可以直接用 `sql`，但此时**必须显式声明列结构**：
+
+```ts
+import { sql } from 'drizzle-orm';
+import { integer, pgView, serial, text } from 'drizzle-orm/pg-core';
+
+export const newYorkers = pgView('new_yorkers', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  cityId: integer('city_id').notNull(),
+}).as(sql`select * from ${users} where ${users.cityId} = 1`);
+```
+
+## PostgreSQL 物化视图
+
+物化视图把查询结果**物理存储**下来，查询快但数据是快照，需要手动刷新：
+
+```ts title="src/db/schema.ts"
+import { pgMaterializedView, uniqueIndex } from 'drizzle-orm/pg-core';
+
+export const cityStats = pgMaterializedView('city_stats').as((qb) =>
+  qb.select({ cityId: users.cityId, count: sql<number>`count(*)::int` })
+    .from(users)
+    .groupBy(users.cityId),
+); // 用 qb 定义时列结构自动推导
+```
+
+刷新数据：
+
+```ts
+await db.refreshMaterializedView(cityStats);                // 普通刷新，期间阻塞读
+await db.refreshMaterializedView(cityStats).concurrently(); // 并发刷新，不阻塞读
+await db.refreshMaterializedView(cityStats).withNoData();   // 清空数据（REFRESH ... WITH NO DATA）
+```
+
+`concurrently()` 要求物化视图上**至少有一个唯一索引**，可以在第三个参数的回调里声明（写法与表一致）：
+
+```ts
+export const cityStats = pgMaterializedView(
+  'city_stats',
+  { cityId: integer('city_id'), count: integer('count') },
+  (view) => [uniqueIndex('city_stats_city_idx').on(view.cityId)],
+).as(sql`select city_id, count(*)::int as count from users group by city_id`);
+```
+
+其他要点：
+
+- 声明期的 `.withNoData()`：创建时不填充数据（`WITH NO DATA`），首次查询前必须先 refresh，否则报错。
+- `.using('heap')`、`.with({ fillfactor: 90 })`、`.tablespace('...')` 可控制存储参数。
+- 普通 `pgView` 也支持 `.with({ checkOption: 'cascaded', securityBarrier: true, securityInvoker: true })`；`securityInvoker: true`（PG 15+）让视图以查询者权限执行，是[通过视图实施 RLS](/docs/rls) 的关键。
+
+## 既有视图：.existing()
+
+如果视图已经存在于数据库中（例如 DBA 维护、或只读接入的库），用 `.existing()` 声明。`drizzle-kit` 会**忽略它，不生成 CREATE VIEW**，你只获得类型安全的查询能力：
+
+```ts
+export const trimmedUsers = pgView('trimmed_users', {
+  id: integer('id'),
+  name: text('name'),
+}).existing(); // 必须显式声明列结构
+```
+
+MySQL 的 `mysqlView(...).existing()` 与 SQLite 的 `sqliteView(...).existing()` 用法相同。
+
+## 迁移行为与陷阱
+
+<Callout type="warn" title="视图变更是 DROP + CREATE">
+视图定义无法原地 ALTER。修改 `.as()` 里的查询后，`drizzle-kit generate` 会生成 `DROP VIEW` + `CREATE VIEW`。依赖该视图的其他视图会导致 DROP 失败，需要在自定义迁移里手动处理依赖顺序（或谨慎使用 CASCADE）。
+</Callout>
+
+- 视图引用的**底层表列改名/删除**时，kit 不会自动重建视图，迁移可能执行失败或视图悄然失效，务必检查生成的 SQL。
+- `.existing()` 视图完全不参与迁移：改了列声明只影响 TypeScript 类型，不会碰数据库；列声明与真实视图不一致时错误只会在运行时暴露。
+- 物化视图的刷新不在迁移职责内，通常由定时任务或写入后的钩子触发。
+- `drizzle-kit push` 对视图同样采用重建策略，生产环境建议走 generate + 审查。
+
+<Cards>
+  <Card title="RLS 行级安全" href="/docs/rls" description="配合 securityInvoker 视图实现行级权限。" />
+  <Card title="查询构建器" href="/docs/queries" description="视图查询与表查询共用同一套 select API。" />
+  <Card title="迁移" href="/docs/migrations" description="理解 generate 的 DDL 生成与自定义迁移。" />
+</Cards>

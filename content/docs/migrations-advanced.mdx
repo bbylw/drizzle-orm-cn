@@ -1,0 +1,165 @@
+---
+title: 迁移进阶
+description: 团队协作中的迁移冲突处理、web 与 mobile 环境的迁移打包与运行时执行、自定义 SQL 与数据迁移。
+---
+
+本页覆盖 [迁移](/docs/migrations) 基础工作流之外的三类场景：多人协作、web/mobile 运行时环境、以及 schema 差异无法表达的数据迁移。命令细节见 [drizzle-kit 命令参考](/docs/kit-commands)。
+
+## 团队协作工作流
+
+多个开发者在不同分支上修改 schema 时，迁移文件可能互相冲突。推荐流程：
+
+<Steps>
+<Step>
+在功能分支上修改 schema，运行 `bunx drizzle-kit generate` 生成迁移，把 SQL 与快照一起提交。
+</Step>
+<Step>
+PR 中审查生成的 SQL。CI 固定运行 `bunx drizzle-kit check`，检查迁移历史是否存在冲突。
+</Step>
+<Step>
+合并分支后，在本地再跑一次 `check`。若报告冲突，按下文处理后再合并下一批变更。
+</Step>
+<Step>
+部署时由**单一**部署步骤执行 `bunx drizzle-kit migrate`，避免多实例并发执行迁移。
+</Step>
+</Steps>
+
+```bash title="CI 中的检查步骤"
+# 迁移历史一致性检查（不连接数据库）
+bunx drizzle-kit check
+
+# 确认 schema 与已提交的迁移保持同步
+bunx drizzle-kit generate
+git diff --exit-code drizzle/
+```
+
+### 合并冲突与 snapshot 冲突
+
+两个分支各自生成了迁移，合并时会出现两类问题：
+
+| 冲突类型 | 表现 | 处理方式 |
+| --- | --- | --- |
+| 文本冲突 | 迁移日志 / 快照文件在 git 层面冲突 | 手工合并，保留双方的迁移条目与顺序 |
+| 迁移碰撞（collision） | `check` 报告两条迁移基于同一快照分叉 | 删除较晚生成的迁移文件夹，基于合并后的 schema 重新 `generate` |
+
+处理碰撞的推荐步骤：
+
+1. 保留先合入主干的那条迁移。
+2. 删除另一条迁移的文件夹（它尚未在任何共享环境执行过才可以删）。
+3. 重新运行 `bunx drizzle-kit generate`，让 drizzle-kit 基于最新快照重新生成差异。
+4. 运行 `bunx drizzle-kit check` 确认通过。
+
+`generate` 与 `check` 都提供 `--ignore-conflicts` 来跳过交换性检查，但官方明确表示：需要它时大概率是工具的检查 bug，应反馈而非长期绕过。
+
+<Callout type="info" title="官方文档状态">
+官方的 kit-migrations-for-teams 页面正在等待新版迁移目录结构发布后重写，目前以 `check` 命令文档与上述实践为准。
+</Callout>
+
+## web 与 mobile 环境的迁移
+
+浏览器与移动端没有文件系统，也不能在运行时调用 CLI。核心思路：**迁移文件在构建期打包进应用，运行时用 `migrate()` 或配套 hook 执行**。
+
+### 服务端 / Node.js 运行时执行
+
+部署脚本之外，也可以在应用启动时用 ORM 自带的 migrator 执行迁移（适合单机或测试环境）：
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+
+const db = drizzle(process.env.DATABASE_URL!);
+// 默认读取 ./drizzle 迁移目录
+await migrate(db);
+```
+
+### Expo / React Native（SQLite）
+
+Expo SQLite 的完整流程如下（OP SQLite、React Native 同理，参见各自 Get Started 指南）：
+
+<Steps>
+<Step>
+安装 babel 插件，把 `.sql` 文件以字符串形式内联进 bundle：
+
+```bash
+npm install babel-plugin-inline-import
+```
+</Step>
+<Step>
+更新 `babel.config.js` 与 `metro.config.js`：
+
+```js title="babel.config.js"
+module.exports = function (api) {
+  api.cache(true);
+  return {
+    presets: ['babel-preset-expo'],
+    plugins: [['inline-import', { extensions: ['.sql'] }]],
+  };
+};
+```
+
+```js title="metro.config.js"
+const { getDefaultConfig } = require('expo/metro-config');
+
+/** @type {import('expo/metro-config').MetroConfig} */
+const config = getDefaultConfig(__dirname);
+config.resolver.sourceExts.push('sql'); // 让 Metro 识别 .sql
+module.exports = config;
+```
+</Step>
+<Step>
+在 `drizzle.config.ts` 中设置 `dialect: 'sqlite'` 与 `driver: 'expo'`（后者非常关键），然后运行 `bunx drizzle-kit generate`。
+</Step>
+<Step>
+在应用入口导入生成的 `migrations.js`，用 `useMigrations` 在启动时执行：
+
+```tsx title="App.tsx"
+import { drizzle } from 'drizzle-orm/expo-sqlite';
+import { openDatabaseSync } from 'expo-sqlite';
+import { useMigrations } from 'drizzle-orm/expo-sqlite/migrator';
+import migrations from './drizzle/migrations';
+
+const expoDb = openDatabaseSync('db.db');
+const db = drizzle(expoDb);
+
+export default function App() {
+  const { success, error } = useMigrations(db, migrations);
+  if (error) return <Text>Migration error: {error.message}</Text>;
+  if (!success) return <Text>Migration is in progress...</Text>;
+  return /* 你的应用组件 */ null;
+}
+```
+</Step>
+</Steps>
+
+<Callout type="warn" title="移动端迁移只进不退">
+应用一旦带着某批迁移发布，就不能再修改这些文件——用户设备上可能已经执行过。修正只能追加新迁移。
+</Callout>
+
+## 自定义 SQL 与数据迁移
+
+schema 差异表达不了的变更（数据回填、创建扩展、权限、`RENAME COLUMN` 等），用空迁移手写 SQL：
+
+```bash
+bunx drizzle-kit generate --custom --name=backfill_slugs
+```
+
+```sql title="drizzle/20242409125510_backfill_slugs/migration.sql"
+UPDATE posts
+SET slug = lower(replace(title, ' ', '-'))
+WHERE slug IS NULL;
+```
+
+要点：
+
+- 数据迁移与结构迁移走同一条日志，按顺序执行、可审查。
+- 大表回填考虑分批执行，避免长事务与锁表。
+- 需要「可重复运行」的开发/测试数据，不要用迁移，改用 [Drizzle Seed](/docs/seed)。
+- 破坏性结构变更遵循 expand/contract：先扩展（加新列、双写、回填），切换读写后再收缩（删旧列）。完整讨论见 [迁移](/docs/migrations)。
+
+## 下一步
+
+<Cards>
+  <Card title="drizzle-kit 命令参考" href="/docs/kit-commands" description="check、generate --custom 等命令细节" />
+  <Card title="Drizzle Seed" href="/docs/seed" description="确定性的开发与测试数据" />
+  <Card title="迁移" href="/docs/migrations" description="基础工作流与破坏性变更" />
+</Cards>

@@ -1,0 +1,100 @@
+---
+title: 读写分离
+description: 用 withReplicas 把 SELECT 路由到只读副本、写操作固定走主库，支持自定义权重路由与 $primary 强制主库。
+---
+
+当项目部署了一组只读副本（read replica）时，Drizzle 的 `withReplicas()` 可以自动管理路由：**SELECT 走副本，insert / update / delete 走主库**。API 以官方 [Read Replicas 文档](https://orm.drizzle.team/docs/read-replicas)为准，PostgreSQL / MySQL / SQLite 各方言均有对应导出。
+
+## 基本用法
+
+`withReplicas` 从方言 core 包导出（PostgreSQL 为 `drizzle-orm/pg-core`）。第一个参数是主库实例，第二个是副本数组：
+
+```ts title="db.ts"
+import { eq, sql } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import {
+  boolean,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+  withReplicas,
+} from 'drizzle-orm/pg-core';
+
+const usersTable = pgTable('users', {
+  id: serial().primaryKey(),
+  name: text().notNull(),
+  verified: boolean().notNull().default(false),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+const primaryDb = drizzle('postgres://user:password@host:port/primary_db');
+const read1 = drizzle('postgres://user:password@host:port/read_replica_1');
+const read2 = drizzle('postgres://user:password@host:port/read_replica_2');
+
+const db = withReplicas(primaryDb, [read1, read2]);
+```
+
+之后像平常一样使用 `db`，Drizzle 自动选择实例：
+
+```ts
+// 读：从 read1 或 read2 中随机选择
+await db.select().from(usersTable);
+
+// 写：固定使用主库
+await db.delete(usersTable).where(eq(usersTable.id, 1));
+```
+
+## 强制读主库：`$primary`
+
+某些读操作必须看到最新数据（例如写完立刻回读），用 `db.$primary` 强制走主库：
+
+```ts
+// 即使是 select 也读主库
+await db.$primary.select().from(usersTable);
+```
+
+## 自定义路由策略（权重）
+
+第三个参数可以传入自定义选择函数，实现加权随机或任意路由逻辑。官方示例：第一个副本 70% 概率、第二个 30%：
+
+```ts
+const db = withReplicas(primaryDb, [read1, read2], (replicas) => {
+  const weight = [0.7, 0.3];
+  let cumulativeProbability = 0;
+  const rand = Math.random();
+
+  for (const [i, replica] of replicas.entries()) {
+    cumulativeProbability += weight[i]!;
+    if (rand < cumulativeProbability) return replica;
+  }
+  return replicas[0]!;
+});
+
+await db.select().from(usersTable);
+```
+
+<Callout type="info" title="权重不是内置配置">
+Drizzle 没有声明式的 weights 选项——权重、按地域路由、按负载选择等策略都通过这个回调自己实现。不传回调时，默认在副本间随机选择。
+</Callout>
+
+## 事务与一致性
+
+- **事务始终在主库上执行**：`db.transaction()` 基于主库连接创建，事务内的读写天然一致，不会被路由到副本。
+- **复制延迟是副本的固有问题**：主库提交后，副本可能需要毫秒到秒级才追上。对「写后读」敏感的查询，用 `db.$primary` 或放进[事务](/docs/transactions)。
+- 副本只应承接读流量；把写操作发给只读副本会直接报错。
+
+```ts
+// 转账这类强一致操作：事务内全部走主库
+await db.transaction(async (tx) => {
+  await tx.update(accounts).set({ balance: sql`balance - 100` }).where(eq(accounts.id, from));
+  await tx.update(accounts).set({ balance: sql`balance + 100` }).where(eq(accounts.id, to));
+});
+```
+
+## 实践建议
+
+- 主库与每个副本分别维护[连接池](/docs/connections)，副本数量变化时只需调整数组。
+- 报表、列表页、搜索等可容忍轻微陈旧的读流量优先放副本；详情页的写后回读走 `$primary`。
+- 读写分离解决的是**吞吐**问题，单条查询慢仍要靠[索引与查询优化](/docs/performance)；热点读可以叠加[查询缓存](/docs/cache)。
+- 监控复制延迟（PostgreSQL 可查 `pg_stat_replication`），延迟异常时把读流量临时切回主库。

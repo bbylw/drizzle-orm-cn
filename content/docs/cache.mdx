@@ -1,0 +1,218 @@
+---
+title: 查询缓存
+description: 用 upstashCache 与 $withCache 为 Drizzle 查询加上显式或全局缓存，理解自动失效、TTL 与写后读一致性。
+---
+
+Drizzle 默认把每条查询直接发给数据库：**没有隐藏动作，没有自动缓存**。想要缓存必须显式开启（opt-in）。默认策略是 `explicit`（即 `global: false`），只有标记过的查询才走缓存；也可以切换为 `all`（`global: true`），让所有 select 先查缓存。
+
+本页 API 以官方 [Cache 文档](https://orm.drizzle.team/docs/cache)为准，适用于 PostgreSQL / MySQL / SQLite 等各方言。
+
+## 快速开始：Upstash 集成
+
+Drizzle 内置 `upstashCache()` 助手，基于 Upstash Redis。设置了环境变量时可以自动读取配置：
+
+```ts title="db.ts"
+import { upstashCache } from 'drizzle-orm/cache/upstash';
+import { drizzle } from 'drizzle-orm/node-postgres';
+
+const db = drizzle(process.env.DB_URL!, {
+  cache: upstashCache({
+    token: process.env.UPSTASH_TOKEN,
+    url: process.env.UPSTASH_URL,
+  }),
+});
+```
+
+也可以显式传入凭据、开启全局缓存、设置默认缓存行为：
+
+```ts
+const db = drizzle(process.env.DB_URL!, {
+  cache: upstashCache({
+    url: '<UPSTASH_URL>',
+    token: '<UPSTASH_TOKEN>',
+    // 所有查询默认走缓存
+    global: true,
+    // 默认缓存配置：60 秒过期
+    config: { ex: 60 },
+  }),
+});
+```
+
+Upstash 支持的 `CacheConfig` 选项：
+
+```ts
+export type CacheConfig = {
+  /** 过期时间，单位秒（正整数） */
+  ex?: number;
+  /** 对 hash key 的字段设置 TTL，用于 HEXPIRE 命令 */
+  hexOptions?: 'NX' | 'nx' | 'XX' | 'xx' | 'GT' | 'gt' | 'LT' | 'lt';
+};
+```
+
+## 显式缓存（默认，`global: false`）
+
+不传 `global: true` 时，普通查询**不读缓存**：
+
+```ts
+// 直接查数据库
+const res = await db.select().from(users);
+
+// 但任何写操作仍会触发缓存的 onMutate，
+// 尝试失效涉及相关表的已缓存查询
+await db.insert(users).values({ email: 'cacheman@upstash.com' });
+```
+
+要让某条查询读缓存，链式调用 `.$withCache()`：
+
+```ts
+const res = await db.select().from(users).$withCache();
+```
+
+`.$withCache()` 支持按查询覆盖配置：
+
+```ts
+// 覆盖这条查询的缓存配置
+.$withCache({ config: { ex: 30 } })
+
+// 自定义缓存 key（默认是对 query + params 做哈希）
+.$withCache({ tag: 'custom_key' })
+
+// 关闭这条查询的自动失效（会导致最终一致，见下文）
+.$withCache({ autoInvalidate: false })
+```
+
+## 隐式缓存（`global: true`）
+
+开启后所有 select 默认先查缓存；个别查询可以用 `.$withCache(false)` 退出：
+
+```ts
+const db = drizzle(process.env.DB_URL!, {
+  cache: upstashCache({ url: '', token: '', global: true }),
+});
+
+// 走缓存
+const res = await db.select().from(users);
+
+// 这条查询强制绕过缓存
+const fresh = await db.select().from(users).$withCache(false);
+```
+
+## 失效策略
+
+**自动失效**：默认开启 `autoInvalidate`。执行 insert / update / delete 时，缓存层的 `onMutate` 会失效所有涉及被改动表的已缓存查询。
+
+**手动失效**：通过 `db.$cache.invalidate()` 按表或 tag 精确清理：
+
+```ts
+// 按表对象失效
+await db.$cache.invalidate({ tables: users });
+await db.$cache.invalidate({ tables: [users, posts] });
+
+// 按表名失效
+await db.$cache.invalidate({ tables: 'usersTable' });
+await db.$cache.invalidate({ tables: ['usersTable', 'postsTable'] });
+
+// 按自定义 tag 失效（对应 $withCache({ tag }) 定义的 key）
+await db.$cache.invalidate({ tags: 'custom_key' });
+await db.$cache.invalidate({ tags: ['custom_key', 'custom_key1'] });
+```
+
+### 最终一致性与写后读
+
+只有手动设置 `autoInvalidate: false` 时才需要关心最终一致性。适合数据变化少、能容忍短暂陈旧的场景（商品列表、博客文章），或你自己管理失效的情况。多数场景建议保持默认开启。
+
+```ts
+// 3 秒 TTL，且关闭自动失效
+const recent = await db
+  .select()
+  .from(usersTable)
+  .$withCache({ config: { ex: 3 }, autoInvalidate: false });
+```
+
+此时执行 `db.insert(usersTable)...` 不会立即失效缓存：最长 3 秒内仍会读到旧数据，直到 TTL 到期才恢复一致。
+
+<Callout type="warn" title="写后读一致性">
+「写完立刻读」的业务路径（下单后查订单、改资料后回显）不要依赖关闭了自动失效的缓存。要么保持 `autoInvalidate` 默认开启，要么对这类查询使用 `.$withCache(false)` 直连数据库。
+</Callout>
+
+## 自定义缓存后端
+
+缓存是可插拔的：继承 `Cache`，实现取数、写入与失效三个钩子即可接入任意存储（下面是基于 Keyv 的简化示例）：
+
+```ts
+import Keyv from 'keyv';
+import { Cache } from 'drizzle-orm/cache';
+import { is, getTableName } from 'drizzle-orm';
+import { Table } from 'drizzle-orm/pg-core';
+
+class KeyvCache extends Cache {
+  private usedTablesPerKey: Record<string, string[]> = {};
+
+  constructor(private kv: Keyv = new Keyv()) {
+    super();
+  }
+
+  // 'explicit'：仅 $withCache() 的查询走缓存；'all'：全局缓存
+  override strategy(): 'explicit' | 'all' {
+    return 'all';
+  }
+
+  // key 是 query + params 的哈希，返回缓存的结果数组
+  override async get(key: string): Promise<any[] | undefined> {
+    return (await this.kv.get(key)) ?? undefined;
+  }
+
+  // 写入结果，并记录表 -> key 的映射用于失效
+  override async put(
+    key: string,
+    response: any,
+    tables: string[],
+    isTag: boolean = false,
+    config?: { ex?: number; px?: number },
+  ): Promise<void> {
+    const ttl = config?.px ?? (config?.ex ? config.ex * 1000 : 1000);
+    await this.kv.set(key, response, ttl);
+    for (const table of tables) {
+      (this.usedTablesPerKey[table] ??= []).push(key);
+    }
+  }
+
+  // insert/update/delete 时被调用：按表与 tag 清理
+  override async onMutate(params: {
+    tags: string | string[];
+    tables: string | string[] | Table<any> | Table<any>[];
+  }): Promise<void> {
+    const tables = Array.isArray(params.tables) ? params.tables : [params.tables];
+    for (const table of tables) {
+      const name = is(table, Table) ? getTableName(table) : (table as string);
+      for (const key of this.usedTablesPerKey[name] ?? []) {
+        await this.kv.delete(key);
+      }
+      this.usedTablesPerKey[name] = [];
+    }
+    const tags = Array.isArray(params.tags) ? params.tags : [params.tags];
+    for (const tag of tags) await this.kv.delete(tag);
+  }
+}
+
+const db = drizzle(process.env.DB_URL!, { cache: new KeyvCache() });
+```
+
+自定义后端的完整 `CacheConfig` 还支持 `px`（毫秒）、`exat` / `pxat`（Unix 过期时刻）、`keepTtl`（更新时保留原 TTL）与 `hexOptions`。
+
+## 限制
+
+以下查询**不会**被 cache 扩展处理：
+
+- 原生 SQL：通过 `db.execute()` 执行的 raw 查询；
+- [事务](/docs/transactions)内的查询。
+
+以下是官方标注「暂不支持、后续会补上」的临时限制：
+
+- 关系查询（`db.query.users.findMany()`）；
+- AWS Data API 驱动；
+- 视图（views）。
+
+<Callout type="info" title="什么时候值得加缓存">
+缓存适合读多写少、可容忍短暂陈旧的热点查询（配置、榜单、商品目录）。先做好[索引与查询优化](/docs/performance)，再考虑缓存；连接层面的注意事项见[连接管理](/docs/connections)。
+</Callout>

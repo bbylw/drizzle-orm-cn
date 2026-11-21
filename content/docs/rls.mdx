@@ -1,0 +1,165 @@
+---
+title: 行级安全（RLS）
+description: 用 pgPolicy 声明 PostgreSQL 行级安全策略，掌握 enableRLS、角色、current_setting 与 Supabase / Neon 场景。
+---
+
+行级安全（Row Level Security）让 PostgreSQL 在**数据库层**按行过滤读写：同一张表，不同角色/不同用户只能看到属于自己的行。Drizzle 提供 `pgPolicy` 与 `pgRole` 把策略写进 schema，由 `drizzle-kit` 生成对应 DDL。这是 PostgreSQL 专属能力。
+
+## 基本用法：pgPolicy + enableRLS
+
+策略声明在 `pgTable` 第三个参数的回调数组里，与索引并列；表上再调用 `.enableRLS()` 开启行级安全：
+
+```ts title="src/db/schema.ts"
+import { sql } from 'drizzle-orm';
+import { pgPolicy, pgTable, text, uuid } from 'drizzle-orm/pg-core';
+
+export const posts = pgTable(
+  'posts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    authorId: uuid('author_id').notNull(),
+    title: text('title').notNull(),
+  },
+  (table) => [
+    pgPolicy('authors can read own posts', {
+      for: 'select',                        // 作用于哪类语句
+      to: 'public',                         // 作用于哪些角色
+      using: sql`${table.authorId} = current_setting('app.user_id')::uuid`,
+    }),
+    pgPolicy('authors can write own posts', {
+      for: 'all',
+      to: 'public',
+      using: sql`${table.authorId} = current_setting('app.user_id')::uuid`,
+      withCheck: sql`${table.authorId} = current_setting('app.user_id')::uuid`,
+    }),
+  ],
+).enableRLS();
+```
+
+`pgPolicy(name, options)` 的完整选项：
+
+| 选项 | 取值 | 说明 |
+| --- | --- | --- |
+| `as` | `'permissive'`（默认）/ `'restrictive'` | permissive 策略之间取 OR；restrictive 与其他策略取 AND |
+| `for` | `'all'`（默认）/ `'select'` / `'insert'` / `'update'` / `'delete'` | 策略作用的语句类型 |
+| `to` | `'public'` / `'current_user'` / `'current_role'` / `'session_user'` / 角色名字符串 / `pgRole` 对象（可数组） | 策略适用的角色 |
+| `using` | `sql` 表达式 | 过滤**已存在的行**（select / update / delete） |
+| `withCheck` | `sql` 表达式 | 校验**新写入的行**（insert / update） |
+
+<Callout type="warn" title="开启 RLS 后默认拒绝一切">
+`enableRLS()` 之后若没有任何匹配的策略，普通角色对该表的读写会**全部被静默过滤/拒绝**——select 返回空集而不是报错。上线前务必为每类操作准备策略，否则症状是"数据神秘消失"。
+</Callout>
+
+`drizzle-kit` 的行为：只要表上声明了 `pgPolicy`，即使没写 `.enableRLS()` 也会生成启用 RLS 的语句；而**删除最后一条策略时，kit 会同时关闭 RLS**。若希望"策略清空但 RLS 仍保持开启（默认拒绝）"，v1 起提供 `pgTable.withRLS('posts', ...)` 写法，`.enableRLS()` 在 v1 中被标记废弃；本站示例采用当前稳定版的 `.enableRLS()`。
+
+## 角色：pgRole 与 .existing()
+
+策略可以绑定自建角色；平台上已有的角色用 `.existing()` 声明（kit 不生成 `CREATE ROLE`）：
+
+```ts
+import { pgRole } from 'drizzle-orm/pg-core';
+
+export const appAdmin = pgRole('app_admin', { createRole: true, createDb: true, inherit: true });
+export const appUser = pgRole('app_user').existing(); // 数据库里已存在
+
+pgPolicy('admin full access', { to: appAdmin, for: 'all', using: sql`true`, withCheck: sql`true` });
+```
+
+要让 kit 管理角色的创建/删除，需在 `drizzle.config.ts` 打开 roles 实体：
+
+```ts title="drizzle.config.ts"
+export default defineConfig({
+  // ...
+  entities: {
+    roles: true,                          // 管理全部声明的角色
+    // roles: { exclude: ['admin'] },     // 或排除某些
+    // roles: { provider: 'supabase' },   // 托管平台内置角色自动按 existing 处理
+  },
+});
+```
+
+`provider: 'neon' | 'supabase'` 会让 kit 忽略平台内置角色，避免误删。已有表上的策略也可用 `pgPolicy(...).link(table)` 在表声明之外挂接。
+
+## 用 current_setting 传递用户身份
+
+RLS 表达式里拿"当前用户"通常靠会话变量。应用侧在事务里设置，策略里读取：
+
+```ts
+await db.transaction(async (tx) => {
+  // set_config 第三参 true = 仅本事务生效（SET LOCAL）
+  await tx.execute(sql`select set_config('app.user_id', ${userId}, true)`);
+  return tx.select().from(posts); // 只能看到该用户的行
+});
+```
+
+用连接池时**必须用事务级 `SET LOCAL` / `set_config(..., true)`**，会话级设置会泄漏到复用同一连接的其他请求，造成越权。
+
+## Supabase 场景
+
+`drizzle-orm/supabase` 提供内置角色与表，`auth.uid()` 从请求 JWT 中解析用户：
+
+```ts
+import { authenticatedRole, anonRole, authUid, authUsers } from 'drizzle-orm/supabase';
+import { pgPolicy, pgTable, text, uuid } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+
+export const todos = pgTable(
+  'todos',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id').notNull().references(() => authUsers.id), // 引用 auth.users
+    title: text('title').notNull(),
+  },
+  (table) => [
+    pgPolicy('crud own todos', {
+      to: authenticatedRole,
+      for: 'all',
+      using: sql`${table.userId} = (select auth.uid())`, // 包一层 select 可让 PG 缓存结果，性能更好
+      withCheck: sql`${table.userId} = (select auth.uid())`,
+    }),
+  ],
+).enableRLS();
+```
+
+服务端用 postgres/service 角色连接时 RLS 会被绕过；要"以某个用户身份"执行，需要在事务里模拟 JWT 声明并切换角色：
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.execute(sql`select set_config('request.jwt.claims', ${JSON.stringify(claims)}, true)`);
+  await tx.execute(sql`set local role authenticated`);
+  return tx.select().from(todos);
+}); // 事务结束自动恢复，无需手动 reset
+```
+
+## Neon 场景
+
+`drizzle-orm/neon` 提供 `crudPolicy` 快捷策略与 `authUid` helper（基于 Neon RLS 的 `auth.user_id()`）：
+
+```ts
+import { crudPolicy, authenticatedRole, authUid } from 'drizzle-orm/neon';
+
+export const notes = pgTable(
+  'notes',
+  { id: uuid('id').primaryKey().defaultRandom(), userId: text('user_id').notNull(), body: text('body') },
+  (table) => [
+    // 等价于展开的四条 pgPolicy：本人可读可写
+    crudPolicy({ role: authenticatedRole, read: authUid(table.userId), modify: authUid(table.userId) }),
+  ],
+).enableRLS();
+```
+
+`read` / `modify` 传 `true` 表示放行、`false` 表示禁止、传 `sql` 表示条件表达式。Neon 的匿名/认证角色通过其 Auth 集成注入会话。
+
+## 测试与绕过陷阱
+
+- **表 owner 与 superuser 默认绕过 RLS**。应用日常连接不要用建表账号；需要 owner 也受限则执行 `ALTER TABLE ... FORCE ROW LEVEL SECURITY`（自定义迁移）。
+- `BYPASSRLS` 角色、Supabase 的 `service_role`、Neon 的管理连接都不受策略约束——密钥泄漏即全量数据泄漏。
+- 视图默认以**视图 owner** 权限执行底层查询，会绕过基表 RLS；PG 15+ 用 `pgView(...).with({ securityInvoker: true })` 改为以查询者权限执行（见 [视图](/docs/views)）。
+- 测试策略时用低权限角色 + `set role` 实际跑查询，不要只看 DDL；`explain` 中能看到策略作为 Filter 出现。
+- 策略表达式每行求值，`(select auth.uid())` 写法、给过滤列建索引都能显著降低开销。
+
+<Cards>
+  <Card title="视图" href="/docs/views" description="securityInvoker 视图与 RLS 的配合。" />
+  <Card title="迁移" href="/docs/migrations" description="FORCE RLS 等语句放入自定义迁移。" />
+  <Card title="事务" href="/docs/transactions" description="SET LOCAL 会话变量的事务边界。" />
+</Cards>

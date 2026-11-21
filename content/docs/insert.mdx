@@ -1,0 +1,182 @@
+---
+title: SQL Insert
+description: db.insert() 完整参考：单行与批量插入、默认值与 $default、returning 与 $returningId、onConflict 系列 upsert 与 MySQL onDuplicateKeyUpdate。
+---
+
+本页示例沿用[快速开始](/docs/quickstart)中的 `db` 实例与 `users`、`employees` 等表。`values()` 中的所有值都会自动参数化，不存在 SQL 拼接注入风险。
+
+## 基本插入与类型推导
+
+```ts
+import { db } from './db';
+import { users } from './db/schema';
+
+await db.insert(users).values({ name: 'Andrew' });
+// insert into "users" ("name") values ($1)
+
+// 插入类型由 schema 推导：必填列不可省略，有默认值的列可选
+type NewUser = typeof users.$inferInsert;
+
+async function insertUser(user: NewUser) {
+  return db.insert(users).values(user);
+}
+```
+
+批量插入传数组，生成一条多 values 的 insert：
+
+```ts
+await db.insert(users).values([{ name: 'Andrew' }, { name: 'Dan' }]);
+```
+
+## 默认值与 sql 表达式
+
+- 省略的列使用数据库端 `default`；schema 里 `.default(...)` 定义 SQL 默认值。
+- `.$defaultFn()` / `.$default()` 在**运行时**由 Drizzle 生成值（如 cuid、uuid），适合自定义主键。
+- 值的位置也可以放 `sql` 表达式。
+
+```ts
+import { sql } from 'drizzle-orm';
+import { createId } from '@paralleldrive/cuid2';
+
+// schema 中：id: text().primaryKey().$defaultFn(createId)
+await db.insert(users).values({ name: 'Dan' }); // id 由 createId() 生成
+
+await db.insert(users).values({ name: 'Dan', createdAt: sql`now()` });
+```
+
+## 拿回插入结果
+
+<Tabs items={['PostgreSQL', 'SQLite', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```ts
+// 整行返回
+await db.insert(users).values({ name: 'Dan' }).returning();
+
+// 部分返回
+await db.insert(users).values({ name: 'Dan' }).returning({ insertedId: users.id });
+```
+
+</Tab>
+<Tab value="SQLite">
+
+SQLite 3.35+ 支持 `RETURNING`，用法与 PG 一致：
+
+```ts
+await db.insert(users).values({ name: 'Dan' }).returning();
+await db.insert(users).values({ name: 'Dan' }).returning({ insertedId: users.id });
+```
+
+</Tab>
+<Tab value="MySQL">
+
+MySQL 没有原生 `RETURNING`。Drizzle 提供 `.$returningId()`：对自增主键读取 `insertId`，对 `$defaultFn` 生成的主键直接返回生成值：
+
+```ts
+const result = await db
+  .insert(users)
+  .values([{ name: 'John' }, { name: 'John1' }])
+  .$returningId();
+// 类型：{ id: number }[]；无主键的表则为 {}[]
+```
+
+</Tab>
+</Tabs>
+
+## Upsert：onConflict 系列（PG / SQLite）
+
+冲突时忽略或转为更新，`target` 指定冲突目标列（主键或唯一索引）：
+
+```ts
+// 冲突则什么都不做；不传 target 表示任意唯一约束冲突都忽略
+await db.insert(users).values({ id: 1, name: 'John' }).onConflictDoNothing();
+await db.insert(users).values({ id: 1, name: 'John' }).onConflictDoNothing({ target: users.id });
+
+// 冲突则更新（upsert）
+await db.insert(users)
+  .values({ id: 1, name: 'Dan' })
+  .onConflictDoUpdate({ target: users.id, set: { name: 'John' } });
+```
+
+`set` 中用 `` sql`excluded.列名` `` 引用"本来要插入的新值"；复合唯一索引传数组：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.insert(users)
+  .values({ id: 1, name: 'Dan' })
+  .onConflictDoUpdate({ target: users.id, set: { name: sql`excluded.name` } });
+
+await db.insert(users)
+  .values({ firstName: 'John', lastName: 'Doe' })
+  .onConflictDoUpdate({ target: [users.firstName, users.lastName], set: { firstName: 'John1' } });
+```
+
+两个可选 where 位置不同、语义不同：
+
+| 选项 | 生成的 SQL | 用途 |
+| --- | --- | --- |
+| `targetWhere` | `on conflict (col) where ...` | 匹配部分索引（partial index） |
+| `setWhere` | `do update set ... where ...` | 满足条件才执行更新 |
+
+```ts
+await db.insert(users)
+  .values({ id: 1, name: 'John Doe' })
+  .onConflictDoUpdate({
+    target: users.id,
+    set: { name: sql`excluded.name` },
+    setWhere: sql`name <> 'John Doe'`, // 已有行名字不同才更新
+  });
+```
+
+## Upsert：onDuplicateKeyUpdate（MySQL）
+
+MySQL 用 `ON DUPLICATE KEY UPDATE`，**不需要也不能指定 target**——任意主键或唯一索引冲突都会触发更新：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+await db.insert(users)
+  .values({ id: 1, name: 'John' })
+  .onDuplicateKeyUpdate({ set: { name: 'John' } });
+
+// MySQL 没有"冲突则忽略"，把某列设为自身即可实现 no-op
+await db.insert(users)
+  .values({ id: 1, name: 'John' })
+  .onDuplicateKeyUpdate({ set: { id: sql`id` } });
+```
+
+<Callout type="warn" title="方言差异速记">
+PG/SQLite：`onConflictDoNothing` / `onConflictDoUpdate`（需指定 target）。MySQL：`onDuplicateKeyUpdate`（无 target），忽略冲突用 ``set: { id: sql`id` }`` 技巧。跨方言代码不要混用这两组方法。
+</Callout>
+
+## Insert into … select
+
+把一个 select 的结果直接插入另一张表，三种方言语法一致（v1 新增）：
+
+```ts
+import { eq } from 'drizzle-orm';
+
+// 形式一：直接传查询
+await db.insert(employees).select(
+  db.select({ id: users.id, name: users.name }).from(users).where(eq(users.role, 'employee')),
+);
+
+// 形式二：回调
+await db.insert(employees).select(() =>
+  db.select({ id: users.id, name: users.name }).from(users).where(eq(users.role, 'employee')),
+);
+```
+
+也可以传 `(qb) => qb.select(...)`（独立 QueryBuilder）或 `sql` 模板写的自定义 select。select 的列名需与目标表列对应。
+
+## 常见坑
+
+- `values([])` 空数组会报错，批量插入前先判空。
+- PG/SQLite 的 `onConflictDoUpdate` 忘写 `target` 会报类型错误；MySQL 的 `onDuplicateKeyUpdate` 写了 target 反而不存在该选项。
+- 需要"插入并读回 + 业务校验"的原子性时，包在[事务](/docs/transactions)里。
+
+<Cards>
+  <Card title="SQL Update" href="/docs/update" description="set、sql 表达式自增与 update … from。" />
+  <Card title="SQL Delete" href="/docs/delete" description="删除与 returning。" />
+</Cards>
