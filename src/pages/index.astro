@@ -2,6 +2,7 @@
 import Layout from '@/layouts/Layout.astro';
 import { codeToHtml } from 'shiki';
 import {
+  basePath,
   discordUrl,
   docsRoute,
   githubUrl,
@@ -172,8 +173,8 @@ const quickLinks = [
   <div class="landing flex min-h-screen flex-col bg-[#08090a] text-[#f1f3ed]">
     <header class="sticky top-0 z-50 border-b border-white/[0.07] bg-[#08090a]/80 backdrop-blur-xl">
       <div class="mx-auto flex h-[60px] w-full max-w-[1200px] items-center gap-8 px-5 md:px-8">
-        <a href="/" class="flex shrink-0 items-center gap-2.5" aria-label="Drizzle 首页">
-          <img src="/logo.svg" alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
+        <a href={basePath} class="flex shrink-0 items-center gap-2.5" aria-label="Drizzle 首页">
+          <img src={`${basePath}logo.svg`} alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
         </a>
 
         <nav class="hidden items-center gap-1 md:flex" aria-label="主导航">
@@ -745,8 +746,8 @@ const quickLinks = [
       <div class="mx-auto w-full max-w-[1200px] px-5 py-14 md:px-8">
         <div class="grid gap-10 md:grid-cols-[1.5fr_repeat(3,1fr)]">
           <div>
-            <a href="/" class="inline-flex items-center gap-2.5" aria-label="Drizzle 首页">
-              <img src="/logo.svg" alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
+            <a href={basePath} class="inline-flex items-center gap-2.5" aria-label="Drizzle 首页">
+              <img src={`${basePath}logo.svg`} alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
             </a>
           </div>
 
@@ -767,7 +768,7 @@ const quickLinks = [
               <li><a class="text-white/50 transition hover:text-brand" href={officialDocs} target="_blank" rel="noreferrer">官方文档</a></li>
               <li><a class="text-white/50 transition hover:text-brand" href={officialSite} target="_blank" rel="noreferrer">Drizzle 官网</a></li>
               <li><a class="text-white/50 transition hover:text-brand" href={githubUrl} target="_blank" rel="noreferrer">GitHub</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href="/llms.txt">llms.txt</a></li>
+              <li><a class="text-white/50 transition hover:text-brand" href={`${basePath}llms.txt`}>llms.txt</a></li>
             </ul>
           </div>
 
