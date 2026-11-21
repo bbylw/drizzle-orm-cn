@@ -1,0 +1,186 @@
+---
+title: 迁移
+description: 用 drizzle-kit 生成可审查的 SQL 迁移，在 CI 与生产环境中安全地演进数据库。
+---
+
+Drizzle 的迁移模型非常直接：**schema 的每次变更都会生成一个普通 SQL 文件，按顺序执行并记录在数据库中**。没有隐藏的同步逻辑，也没有运行时自动改表。
+
+## 工作流总览
+
+1. 修改 `schema.ts`。
+2. 运行 `drizzle-kit generate`，对比快照生成 SQL 迁移。
+3. 审查 SQL，提交到版本库。
+4. 测试环境执行 `drizzle-kit migrate`。
+5. 部署时在目标环境执行同一批迁移。
+
+## 配置
+
+```ts title="drizzle.config.ts"
+import 'dotenv/config';
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dialect: 'postgresql',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+  migrations: {
+    table: '__drizzle_migrations',
+    schema: 'public',
+  },
+});
+```
+
+## 生成迁移
+
+```bash
+bunx drizzle-kit generate
+```
+
+输出示例：
+
+```text
+Reading config file 'drizzle.config.ts'
+1 tables
+users 5 columns 1 indexes 0 fks
+
+[✓] Your SQL migration file ➜ drizzle/0001_flat_scarecrow.sql 🚀
+```
+
+生成目录结构：
+
+```text
+drizzle/
+├── 0000_init.sql
+├── 0001_add_posts.sql
+└── meta/
+    ├── _journal.json
+    └── 0001_snapshot.json
+```
+
+- `.sql` 文件是实际执行的语句，按序号排序。
+- `meta/` 保存快照与日志，用于下次对比。**它必须和迁移文件一起提交**。
+- 自定义命名：`bunx drizzle-kit generate --name add_posts`。
+
+生成的 SQL 应该逐条审查，尤其是包含 `DROP`、类型收窄、重命名或加非空约束的变更。
+
+## 执行迁移
+
+```bash
+bunx drizzle-kit migrate
+```
+
+`migrate` 会读取迁移目录，跳过已应用的记录，然后按顺序执行剩余文件。执行历史记录在 `__drizzle_migrations` 表中。
+
+```sql
+select * from drizzle.__drizzle_migrations;
+```
+
+<Callout type="warn" title="迁移文件一经部署即不可变">
+不要修改已在任何共享环境执行过的迁移文件。需要修正时，追加一个新的迁移。否则不同环境的迁移历史会分叉，且无法自动修复。
+</Callout>
+
+## 开发期的 push
+
+```bash
+bunx drizzle-kit push
+```
+
+`push` 直接把 schema 差异应用到数据库，不产生迁移文件。它适合本地原型与快速迭代，但**不应作为生产发布流程**：
+
+- 没有可审查的 SQL
+- 没有历史记录，无法回滚
+- 某些破坏性变更需要交互确认
+- 无法在 CI 中重现
+
+需要频繁重置的本地数据库，可以配合 `push --force` 使用，但要确保连接串指向本地。
+
+## 对接已有数据库
+
+对已有 schema 的数据库，先反向生成 TypeScript 定义：
+
+```bash
+bunx drizzle-kit pull
+```
+
+`pull` 会读取数据库结构，输出 schema 文件与迁移目录。之后把生成的文件纳入版本库，再开始正常的 generate/migrate 流程。
+
+首次接入时，建议：
+
+1. 用 `pull` 生成基线 schema。
+2. 与手写 schema 合并，确保类型与命名符合预期。
+3. 生成一个基线迁移，并在数据库中标记为已应用（或使用现有迁移历史）。
+
+## 自定义迁移
+
+当变更无法由 schema 差异表达（数据回填、创建扩展、权限设置）时：
+
+```bash
+bunx drizzle-kit generate --custom --name backfill_slugs
+```
+
+编辑生成的空 SQL 文件：
+
+```sql title="drizzle/0002_backfill_slugs.sql"
+UPDATE posts
+SET slug = lower(replace(title, ' ', '-'))
+WHERE slug IS NULL;
+```
+
+同样需要保证幂等与可重复执行，并考虑大数据量下的分批运行。
+
+## 破坏性变更的正确做法
+
+删列、改类型、加非空约束都可能导致停机或数据丢失。推荐「扩展 → 迁移 → 收缩」：
+
+1. **扩展**：新增列/表，保留旧结构，双写或回填。
+2. **切换**：应用代码开始读写新结构。
+3. **收缩**：确认无引用后，再生成删除旧结构的迁移。
+
+改列名时尤其要小心：自动生成的迁移可能是「删旧列 + 建新列」，数据会丢失。此时应手写迁移（`ALTER TABLE ... RENAME COLUMN`）或分阶段处理。
+
+## 在生产流程中运行
+
+推荐把迁移作为独立步骤，而不是应用启动的一部分：
+
+```bash
+# CI：检查迁移文件是否与 schema 一致
+bunx drizzle-kit generate
+git diff --exit-code drizzle/
+
+# 部署：在目标环境执行迁移
+bunx drizzle-kit migrate
+```
+
+实践建议：
+
+- 生产迁移使用独立数据库账号，权限只覆盖必要的 DDL。
+- 在迁移前做备份或确认 PITR 可用。
+- 大表添加索引优先使用并发创建（如 PostgreSQL 的 `CREATE INDEX CONCURRENTLY`），必要时手写迁移。
+- 记录每次发布的迁移版本，方便定位问题。
+- 多个实例同时启动时，只由一个部署步骤执行迁移，避免并发执行。
+
+## 常见问题
+
+<Accordions>
+<Accordion title="generate 没有生成任何内容？">
+schema 与上次快照一致。检查是否修改了被 `schema` 配置包含的文件，以及是否有多份 drizzle 目录。
+</Accordion>
+<Accordion title="迁移在某个环境失败了怎么办？">
+先查看失败语句与数据库当前状态。Drizzle 不会自动回滚已执行的语句；需要手动修复数据库，或在事务中执行迁移（取决于数据库与驱动）。修复后重新运行 `migrate`。
+</Accordion>
+<Accordion title="可以删除旧迁移文件吗？">
+只在该迁移尚未应用到任何环境、或团队已统一 squash 迁移历史时才可删除，并需要同步清理 `meta/`。生产库一旦执行过，绝不能删除历史文件。
+</Accordion>
+<Accordion title="push 和 migrate 能混用吗？">
+可以，但不推荐在同一环境反复切换。push 不写迁移历史，之后再用 migrate 可能产生冲突。开发环境用 push、生产环境用 migrate 是常见做法。
+</Accordion>
+</Accordions>
+
+## 下一步
+
+- [drizzle-kit CLI](/docs/drizzle-kit)：完整命令与配置参考
+- [Drizzle Studio](/docs/studio)：在迁移后检查数据
+- [事务](/docs/transactions)：需要原子变更时的处理方式

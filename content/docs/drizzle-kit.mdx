@@ -1,0 +1,252 @@
+---
+title: drizzle-kit CLI
+description: drizzle-kit 命令与配置参考：generate、migrate、push、pull、studio、check 与 up。
+---
+
+`drizzle-kit` 是 Drizzle 的配套 CLI，负责 schema 与数据库结构之间的变更。它不参与运行时查询，只在开发、CI 与部署阶段使用。
+
+## 安装
+
+```bash
+bun add -d drizzle-kit
+```
+
+推荐通过 package.json 脚本调用，保证团队与 CI 使用同一版本：
+
+```json title="package.json"
+{
+  "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:pull": "drizzle-kit pull",
+    "db:studio": "drizzle-kit studio"
+  }
+}
+```
+
+## 命令一览
+
+| 命令 | 作用 | 典型场景 |
+| --- | --- | --- |
+| `generate` | 对比 schema 与快照，生成 SQL 迁移 | 每次修改 schema 后 |
+| `migrate` | 按顺序执行未应用的迁移 | 部署与测试环境 |
+| `push` | 直接把 schema 变更应用到数据库 | 本地原型 |
+| `pull` | 从数据库反向生成 schema | 接入既有数据库 |
+| `studio` | 启动本地可视化界面 | 查看与编辑数据 |
+| `check` | 检查迁移文件与快照的一致性 | CI 与发布前 |
+| `up` | 升级旧版本生成的迁移快照格式 | 跨大版本升级 |
+
+## drizzle.config.ts
+
+```ts title="drizzle.config.ts"
+import 'dotenv/config';
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+  migrations: {
+    table: '__drizzle_migrations',
+    schema: 'public',
+  },
+  casing: 'snake_case',
+  strict: true,
+  verbose: true,
+});
+```
+
+### 常用配置项
+
+| 配置 | 说明 |
+| --- | --- |
+| `dialect` | 必填：`postgresql`、`mysql`、`sqlite`、`singlestore`、`gel` |
+| `schema` | schema 文件或目录（支持 glob） |
+| `out` | 迁移文件输出目录，默认 `./drizzle` |
+| `dbCredentials` | 连接信息，字段随方言不同 |
+| `migrations.table` | 迁移记录表名 |
+| `migrations.schema` | 迁移记录表所在 schema（PostgreSQL） |
+| `casing` | 自动命名策略，如 `snake_case` |
+| `strict` | 执行前要求确认破坏性变更 |
+| `verbose` | 输出对比细节与 SQL |
+| `breakpoints` | 是否在语句间生成 `--> statement-breakpoint` 分隔 |
+| `tablesFilter` / `schemaFilter` | 限定 push/pull 作用的表或 schema |
+
+<Callout type="info" title="配置项随版本变化">
+不同版本的 drizzle-kit 支持的字段略有差异。遇到类型错误时，以本地安装版本的 `defineConfig` 类型定义为准。
+</Callout>
+
+## 各数据库的凭据写法
+
+<Tabs items={['PostgreSQL', 'MySQL', 'SQLite']}>
+<Tab value="PostgreSQL">
+
+```ts
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+    // 或拆开填写：
+    // host: 'localhost',
+    // port: 5432,
+    // user: 'postgres',
+    // password: 'postgres',
+    // database: 'app',
+    // ssl: false,
+  },
+});
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```ts
+export default defineConfig({
+  dialect: 'mysql',
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+});
+```
+
+</Tab>
+<Tab value="SQLite">
+
+```ts
+export default defineConfig({
+  dialect: 'sqlite',
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dbCredentials: {
+    url: './app.db',
+  },
+});
+```
+
+远程 libSQL/Turso 使用 `url` + `authToken`。
+
+</Tab>
+</Tabs>
+
+## generate
+
+```bash
+bunx drizzle-kit generate
+bunx drizzle-kit generate --name add_orders
+bunx drizzle-kit generate --custom --name seed_data
+```
+
+常用参数：
+
+- `--config`：指定配置文件路径。
+- `--name`：自定义迁移文件名后缀。
+- `--custom`：生成空迁移文件，用于手写 SQL。
+- `--verbose`：打印详细对比信息。
+
+## migrate
+
+```bash
+bunx drizzle-kit migrate
+```
+
+只执行尚未应用的迁移。执行顺序由文件名与 `meta/_journal.json` 决定，不要手动调整已提交文件的顺序。
+
+迁移历史表：
+
+```sql
+-- PostgreSQL
+select id, hash, created_at from drizzle.__drizzle_migrations order by created_at;
+```
+
+## push
+
+```bash
+bunx drizzle-kit push
+bunx drizzle-kit push --force
+bunx drizzle-kit push --verbose
+```
+
+`push` 根据 schema 与数据库当前状态直接生成并执行 DDL。它适合：
+
+- 本地开发时频繁调整表结构
+- 一次性脚本或临时环境
+- 尚未产生共享数据的原型
+
+不适合生产发布，因为过程不可审查、不可重放。
+
+## pull
+
+```bash
+bunx drizzle-kit pull
+```
+
+从数据库读取表、枚举、索引与外键，生成 TypeScript schema 以及迁移基线。用于：
+
+- 将遗留数据库接入 Drizzle
+- 核对 schema 文件与真实数据库是否一致
+- 生成参考定义后手工整理
+
+生成结果通常需要人工调整命名与组织方式，不建议不加审查直接提交。
+
+## check
+
+```bash
+bunx drizzle-kit check
+```
+
+检查迁移文件夹中的日志与快照是否一致、是否存在冲突。适合放进 CI：
+
+```json title="package.json"
+{
+  "scripts": {
+    "db:check": "drizzle-kit check"
+  }
+}
+```
+
+## up
+
+```bash
+bunx drizzle-kit up
+```
+
+把旧版本 drizzle-kit 生成的快照升级为当前格式。升级 drizzle-kit 大版本后，先执行 `up` 并提交变更，再继续生成新迁移。
+
+## 环境区分
+
+推荐为每个环境准备独立配置或通过环境变量切换：
+
+```ts
+import 'dotenv/config';
+import { defineConfig } from 'drizzle-kit';
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  strict: isProduction,
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+});
+```
+
+<Callout type="warn" title="确认连接串指向正确的数据库">
+`push` 与 `migrate` 都会真实修改数据库。执行前请确认环境变量来自正确环境，尤其是本地终端中残留的生产连接串。
+</Callout>
+
+## 下一步
+
+- [迁移工作流](/docs/migrations)：从变更到上线的完整流程
+- [Drizzle Studio](/docs/studio)：可视化查看数据
+- [快速开始](/docs/quickstart)：从零跑通第一个迁移

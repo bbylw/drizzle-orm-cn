@@ -1,0 +1,228 @@
+---
+title: 连接数据库
+description: 根据运行时选择 PostgreSQL、MySQL、SQLite 与边缘数据库驱动，正确配置连接池、环境变量与类型。
+---
+
+Drizzle 不负责建立连接，而是把「驱动返回的客户端」包装成查询构建器。因此连接方式完全取决于你的数据库与运行时：Node.js 用 TCP 驱动，Cloudflare Workers 用 HTTP 或绑定，Bun 可以直接使用内置 SQLite。
+
+## 环境变量
+
+连接串放在环境变量中，永远不要提交到仓库：
+
+```bash title=".env"
+DATABASE_URL=postgres://user:password@localhost:5432/app
+```
+
+```ts
+import 'dotenv/config';
+
+const url = process.env.DATABASE_URL;
+if (!url) throw new Error('DATABASE_URL is not set');
+```
+
+生产环境请在平台的环境变量面板中配置，并在启动时校验必需变量。
+
+## PostgreSQL
+
+### node-postgres（Node.js 默认选择）
+
+```ts title="src/db/index.ts"
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from './schema';
+
+export const db = drizzle(process.env.DATABASE_URL!, { schema });
+```
+
+需要自定义连接池时，显式传入 `Pool`：
+
+```ts
+import { Pool } from 'pg';
+import { drizzle } from 'drizzle-orm/node-postgres';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+});
+
+export const db = drizzle({ client: pool, schema });
+```
+
+长驻服务（如脚本、worker）结束时记得关闭连接池：
+
+```ts
+await pool.end();
+```
+
+### postgres.js
+
+```ts
+import postgres from 'postgres';
+import { drizzle } from 'drizzle-orm/postgres-js';
+
+const client = postgres(process.env.DATABASE_URL!, { max: 10 });
+export const db = drizzle({ client, schema });
+```
+
+### Neon（HTTP 与 WebSocket）
+
+边缘运行时无法建立 TCP 连接时，使用 HTTP 驱动：
+
+```ts
+import { neon } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-http';
+
+const sql = neon(process.env.DATABASE_URL!);
+export const db = drizzle({ client: sql, schema });
+```
+
+需要事务与交互式会话时，改用 `drizzle-orm/neon`（WebSocket）或 `neon-serverless` 驱动。
+
+### 其他 PostgreSQL 适配器
+
+| 场景 | 导入路径 |
+| --- | --- |
+| Vercel Postgres | `drizzle-orm/vercel-postgres` |
+| Supabase | 使用 `postgres.js` 或 `node-postgres` |
+| PGlite（本地/浏览器内嵌） | `drizzle-orm/pglite` |
+| AWS Data API | `drizzle-orm/aws-data-api/pg` |
+| Xata | `drizzle-orm/xata-http` |
+
+## MySQL
+
+```ts title="src/db/index.ts"
+import mysql from 'mysql2/promise';
+import { drizzle } from 'drizzle-orm/mysql2';
+
+const pool = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  connectionLimit: 10,
+});
+
+export const db = drizzle({ client: pool, schema });
+```
+
+PlanetScale Serverless 驱动：
+
+```ts
+import { connect } from '@planetscale/database';
+import { drizzle } from 'drizzle-orm/planetscale-serverless';
+
+const client = connect({ url: process.env.DATABASE_URL });
+export const db = drizzle({ client, schema });
+```
+
+## SQLite 与边缘数据库
+
+<Tabs items={['Bun SQLite', 'better-sqlite3', 'libSQL / Turso', 'Cloudflare D1']}>
+<Tab value="Bun SQLite">
+
+```ts
+import { Database } from 'bun:sqlite';
+import { drizzle } from 'drizzle-orm/bun-sqlite';
+
+const sqlite = new Database('app.db');
+export const db = drizzle({ client: sqlite, schema });
+```
+
+</Tab>
+<Tab value="better-sqlite3">
+
+```ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+
+const sqlite = new Database('app.db');
+export const db = drizzle({ client: sqlite, schema });
+```
+
+</Tab>
+<Tab value="libSQL / Turso">
+
+```ts
+import { createClient } from '@libsql/client';
+import { drizzle } from 'drizzle-orm/libsql';
+
+const client = createClient({
+  url: process.env.DATABASE_URL!,
+  authToken: process.env.DATABASE_AUTH_TOKEN,
+});
+
+export const db = drizzle({ client, schema });
+```
+
+</Tab>
+<Tab value="Cloudflare D1">
+
+```ts
+import { drizzle } from 'drizzle-orm/d1';
+
+export function getDb(env: { DB: D1Database }) {
+  return drizzle(env.DB, { schema });
+}
+```
+
+在 Workers 中，每次请求通过 `env` 获取绑定；不要在模块顶层缓存请求作用域外的对象。
+
+</Tab>
+</Tabs>
+
+## 传入 schema 的意义
+
+`drizzle(client, { schema })` 中的 `schema` 只影响**关系查询**（`db.query.*`）。普通查询构建器不依赖它，但传入后可以获得 `db.query.users.findMany({ with: { posts: true } })` 这类嵌套查询能力。
+
+```ts
+import * as schema from './schema';
+
+export const db = drizzle({ client, schema });
+```
+
+如果你的 schema 拆分为多个文件，应在 `schema/index.ts` 中统一导出：
+
+```ts title="src/db/schema/index.ts"
+export * from './users';
+export * from './posts';
+export * from './orders';
+```
+
+<Callout type="warn" title="避免循环引用">
+表之间的外键引用应使用回调 `references(() => users.id)`，而不是在模块顶层直接取值。这样可以在拆分文件时避免循环依赖。
+</Callout>
+
+## 日志与调试
+
+```ts
+const db = drizzle({
+  client,
+  logger: true,
+});
+```
+
+自定义日志格式：
+
+```ts
+const db = drizzle({
+  client,
+  logger: {
+    logQuery(query, params) {
+      console.log('[sql]', query, params);
+    },
+  },
+});
+```
+
+开发阶段查看真实 SQL 最直接的方式仍然是查询级 `.toSQL()`，它不会执行查询，只返回语句与参数。
+
+## 连接池与无服务器
+
+- **长驻 Node 服务**：一个进程一个连接池，池大小按数据库上限与并发调整。
+- **无服务器函数**：不要每次调用都创建新池而不释放；优先使用平台提供的连接池（如 Neon、Supabase 的 pooler）。
+- **边缘运行时**：选择 HTTP 驱动（Neon HTTP、Turso HTTP、D1 绑定），避免依赖 TCP。
+- **脚本与 CLI**：执行完毕后显式关闭客户端，避免进程挂起。
+
+## 下一步
+
+- [Schema 与类型](/docs/schema)：定义表结构与约束
+- [事务](/docs/transactions)：需要原子写入时的正确做法
+- [生态系统](/docs/ecosystem)：查看完整驱动列表

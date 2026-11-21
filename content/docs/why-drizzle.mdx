@@ -1,0 +1,80 @@
+---
+title: 为什么选择 Drizzle
+description: 理解 Drizzle 的设计取舍：SQL 优先、类型安全、零代码生成、无头架构，以及它适合与不适合的场景。
+---
+
+ORM 的核心问题不是「能不能查数据」，而是**查询是否可预测、类型是否可信、出问题时是否还能看懂数据库在做什么**。Drizzle 的答案是：尽可能贴近 SQL，同时把 TypeScript 的类型能力发挥到极致。
+
+## 设计原则
+
+### 1. SQL 是唯一的上层语言
+
+Drizzle 不试图抽象掉关系模型。`select`、`join`、`groupBy`、`orderBy`、CTE、窗口函数都保留原名与语义。你知道 SQL 怎么写，就知道 Drizzle 怎么写；反过来，Drizzle 代码也可以直接映射回 SQL 去审查。
+
+```ts
+const rows = await db
+  .select({ name: users.name, count: count(orders.id) })
+  .from(users)
+  .leftJoin(orders, eq(orders.userId, users.id))
+  .groupBy(users.id, users.name);
+```
+
+### 2. Schema 即代码，类型即事实
+
+没有独立的 schema DSL，也没有「生成客户端」这一层。表定义就是 TypeScript 模块，类型由它直接推导，IDE 的跳转、重构、补全全部生效。
+
+### 3. 零代码生成
+
+不需要运行 `generate` 才能开始写查询，不需要提交生成目录，也没有缓存元数据文件。换分支、改 schema、重启编辑器，类型总是最新的。
+
+### 4. 无头架构
+
+Drizzle 只负责两件事：把查询编译成 SQL，把结果映射成类型。数据库驱动、连接池、运行时、部署方式由你决定。它不会替你托管数据库，也不会绑定某个平台。
+
+### 5. 迁移是可审查的 SQL
+
+`drizzle-kit generate` 生成的是普通 SQL 文件，而不是黑盒指令。你可以在合并前 diff、在 CI 中 lint、DBA 可以逐行 review，必要时还能手写自定义迁移。
+
+## 与全功能 ORM 的差异
+
+| 维度 | Drizzle | 全功能 ORM 的常见做法 |
+| --- | --- | --- |
+| 查询方式 | SQL 风格的构建器 | 模型 API 或自定义查询 DSL |
+| Schema 来源 | TypeScript 代码 | 独立 schema 文件，生成客户端 |
+| 代码生成 | 无 | 通常需要 |
+| 运行时职责 | 编译 SQL、推导类型 | 可能包含查询引擎与元数据层 |
+| 复杂查询 | 直接表达，必要时嵌入 SQL | 容易触及抽象上限 |
+| 迁移产物 | 可读的 SQL 文件 | 平台化迁移或运行时同步 |
+
+这不是「谁更先进」的问题，而是取舍：全功能 ORM 用更多抽象换取更低的入门门槛；Drizzle 用更少的抽象换取更高的可控性与可预测性。
+
+## 什么时候适合 Drizzle
+
+- 团队熟悉 SQL，希望 ORM 不成为理解的障碍
+- 需要在无服务器、边缘运行时中保持轻量与低冷启动
+- 对类型安全要求高，且 schema 会持续演进
+- 复杂查询较多，不想频繁「退回裸 SQL」
+- 希望迁移过程可审查、可版本化、可自动化
+
+## 什么时候可能不适合
+
+- 项目使用 MongoDB 等非关系型数据库——Drizzle 只面向 SQL
+- 团队更偏好 Active Record 风格或全托管的数据平台
+- 你希望 ORM 帮你管理连接、缓存、后台任务等一整套基础设施
+
+## 如何验证它是否适合你
+
+1. 用真实业务中最复杂的一条查询改写为 Drizzle，看看是否需要退回大量裸 SQL。
+2. 调用 `.toSQL()` 检查生成的语句与参数，确认它符合你的预期。
+3. 走一遍 schema 变更 → 生成迁移 → review → 上线的流程。
+4. 在你的目标运行时（Node、Bun、Workers）测一次冷启动与包体积。
+
+<Callout type="info" title="关于性能数字">
+具体基准与包体积会随版本和业务形态变化。建议在目标运行时用真实查询自行测量，而不是依赖单一 benchmark。
+</Callout>
+
+## 下一步
+
+- [连接数据库](/docs/connections)：选择适合你运行时的驱动
+- [Schema 与类型](/docs/schema)：设计第一张表
+- [查询构建器](/docs/queries)：看看复杂查询怎么写

@@ -1,0 +1,177 @@
+---
+title: 事务
+description: 使用 db.transaction 保证多条写入的原子性，理解回滚、隔离级别、保存点与驱动差异。
+---
+
+当多条写入必须「同生共死」时，就需要事务。Drizzle 的事务 API 是一层薄封装：回调中的 `tx` 与 `db` 用法一致，回调正常返回则提交，抛出异常则回滚。
+
+## 基本用法
+
+```ts
+import { eq, sql } from 'drizzle-orm';
+import { db } from './db';
+import { accounts, ledger } from './db/schema';
+
+await db.transaction(async (tx) => {
+  await tx
+    .update(accounts)
+    .set({ balance: sql`${accounts.balance} - ${100}` })
+    .where(eq(accounts.id, fromId));
+
+  await tx
+    .update(accounts)
+    .set({ balance: sql`${accounts.balance} + ${100}` })
+    .where(eq(accounts.id, toId));
+
+  await tx.insert(ledger).values({
+    fromId,
+    toId,
+    amount: 100,
+  });
+});
+```
+
+回调中的任何一条语句失败，或者你主动抛出异常，整个事务都会回滚。
+
+## 主动回滚
+
+```ts
+class InsufficientFunds extends Error {}
+
+try {
+  await db.transaction(async (tx) => {
+    const [account] = await tx
+      .select()
+      .from(accounts)
+      .where(eq(accounts.id, fromId));
+
+    if (!account || account.balance < amount) {
+      throw new InsufficientFunds();
+    }
+
+    await tx
+      .update(accounts)
+      .set({ balance: sql`${accounts.balance} - ${amount}` })
+      .where(eq(accounts.id, fromId));
+  });
+} catch (error) {
+  if (error instanceof InsufficientFunds) {
+    // 事务已回滚，返回业务错误
+  }
+  throw error;
+}
+```
+
+<Callout type="warn" title="不要在事务里吞掉异常">
+如果在回调内部捕获了错误却没有重新抛出，Drizzle 会认为事务成功并提交。业务错误应在事务外处理，或捕获后重新抛出。
+</Callout>
+
+## 返回值
+
+```ts
+const newOrder = await db.transaction(async (tx) => {
+  const [order] = await tx
+    .insert(orders)
+    .values({ userId, total: 199 })
+    .returning();
+
+  await tx.insert(orderItems).values({
+    orderId: order.id,
+    productId,
+    quantity: 1,
+  });
+
+  return order;
+});
+```
+
+回调的返回值会作为 `db.transaction()` 的结果。
+
+## 隔离级别与访问模式
+
+PostgreSQL 与 MySQL 支持在事务选项中指定隔离级别：
+
+```ts
+await db.transaction(
+  async (tx) => {
+    // ...
+  },
+  {
+    isolationLevel: 'serializable',
+    accessMode: 'read only',
+  },
+);
+```
+
+常见级别：
+
+| 级别 | 说明 |
+| --- | --- |
+| `read committed` | 默认级别，可能发生不可重复读与幻读 |
+| `repeatable read` | 同一事务内多次读取结果一致 |
+| `serializable` | 最高隔离，冲突时可能要求重试 |
+
+可序列化事务在高并发下可能因序列化冲突而失败，应用需要实现重试逻辑。
+
+SQLite 的事务选项不同，它通过 `behavior` 控制锁的获取时机：
+
+```ts
+await db.transaction(async (tx) => {
+  // ...
+}, { behavior: 'immediate' });
+```
+
+## 嵌套事务与保存点
+
+在 PostgreSQL 与 MySQL 中，在事务内再次调用 `tx.transaction()` 会创建保存点（savepoint），内层回滚不会影响外层已执行的语句：
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.insert(auditLogs).values({ event: 'start' });
+
+  try {
+    await tx.transaction(async (inner) => {
+      await tx.insert(orders).values(order);
+      throw new Error('业务校验失败');
+    });
+  } catch {
+    // 仅内层保存点回滚，外层仍可提交
+  }
+
+  await tx.insert(auditLogs).values({ event: 'end' });
+});
+```
+
+不同驱动的嵌套行为可能不同，SQLite 的保存点支持也受驱动版本影响，使用前请确认目标驱动的文档。
+
+## 行级锁
+
+在 PostgreSQL/MySQL 中，可以在事务内对读取的行加锁，避免并发修改：
+
+```ts
+const [account] = await tx
+  .select()
+  .from(accounts)
+  .where(eq(accounts.id, accountId))
+  .for('update');
+```
+
+SQLite 没有 `SELECT ... FOR UPDATE`，写事务本身会锁定数据库。
+
+## 实践建议
+
+- **保持事务短小**：不要在事务中调用外部 API、发送邮件或等待用户输入。
+- **顺序一致**：多张表、多行加锁时保持固定顺序，降低死锁概率。
+- **设置超时**：通过连接池或数据库参数设置语句与锁等待超时。
+- **失败可重试**：对序列化冲突、死锁等可重试错误实现退避重试。
+- **区分读写**：只读事务可以指定 `read only`，减少锁与开销。
+
+<Callout type="info" title="边缘数据库的限制">
+Cloudflare D1 等边缘数据库对交互式事务的支持有限，通常只能通过批量语句保证原子性。请根据驱动能力调整方案，不要在 Worker 中假设可以开启长事务。
+</Callout>
+
+## 下一步
+
+- [性能](/docs/performance)：连接池与查询效率
+- [查询构建器](/docs/queries)：事务内的 select/update 写法
+- [迁移](/docs/migrations)：DDL 变更的事务边界

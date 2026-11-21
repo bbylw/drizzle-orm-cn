@@ -1,0 +1,130 @@
+---
+title: 生态系统
+description: Drizzle 的驱动矩阵、drizzle-kit、Drizzle Studio、drizzle-seed 与 schema 校验工具。
+---
+
+Drizzle 的核心很小，周围围绕着一组官方工具与社区集成。理解它们各自的职责，可以避免把「迁移工具」「校验库」「GUI」误当成 ORM 的一部分。
+
+## 官方工具
+
+| 工具 | 职责 |
+| --- | --- |
+| `drizzle-orm` | 查询构建器、schema 定义、类型推导 |
+| `drizzle-kit` | 迁移生成与执行、push/pull、Studio 启动 |
+| Drizzle Studio | 本地数据库浏览与编辑界面 |
+| `drizzle-seed` | 可复现的种子数据生成 |
+| `drizzle-zod` | 从 schema 生成 Zod 校验器 |
+| `drizzle-valibot` | 从 schema 生成 Valibot 校验器 |
+| `drizzle-arktype` | 从 schema 生成 ArkType 校验器 |
+
+### drizzle-seed
+
+`drizzle-seed` 可以根据 schema 生成结构合法的测试数据，并通过固定种子保证可复现：
+
+```bash
+bun add -d drizzle-seed
+```
+
+```ts
+import { seed } from 'drizzle-seed';
+import { db } from './db';
+import * as schema from './db/schema';
+
+await seed(db, schema).refine((f) => ({
+  users: {
+    count: 50,
+    columns: {
+      name: f.fullName(),
+      email: f.email(),
+    },
+  },
+  posts: {
+    count: 200,
+  },
+}));
+```
+
+具体生成器与 refine 语法会随版本变化，请以[官方文档](https://orm.drizzle.team/docs/seed-overview)为准。
+
+### schema 校验
+
+以 `drizzle-zod` 为例，同一份 schema 可以同时服务于数据库与 API 输入校验：
+
+```ts
+import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
+import { users } from './db/schema';
+
+export const insertUserSchema = createInsertSchema(users, {
+  email: (schema) => schema.email(),
+});
+
+export const selectUserSchema = createSelectSchema(users);
+```
+
+这样可以避免「数据库 schema」与「请求校验 schema」各写一份而逐渐漂移。
+
+## 驱动矩阵
+
+### PostgreSQL
+
+| 驱动 | 导入路径 | 适用场景 |
+| --- | --- | --- |
+| node-postgres | `drizzle-orm/node-postgres` | Node.js 服务、脚本 |
+| postgres.js | `drizzle-orm/postgres-js` | Node.js、Bun、Deno |
+| Neon HTTP | `drizzle-orm/neon-http` | 边缘与无服务器 |
+| Neon WebSocket | `drizzle-orm/neon` | 需要交互式事务 |
+| Vercel Postgres | `drizzle-orm/vercel-postgres` | Vercel 平台 |
+| PGlite | `drizzle-orm/pglite` | 浏览器、测试、嵌入式 |
+| AWS Data API | `drizzle-orm/aws-data-api/pg` | AWS Lambda + RDS |
+| Xata | `drizzle-orm/xata-http` | Xata 平台 |
+
+### MySQL
+
+| 驱动 | 导入路径 | 适用场景 |
+| --- | --- | --- |
+| mysql2 | `drizzle-orm/mysql2` | Node.js 服务 |
+| PlanetScale | `drizzle-orm/planetscale-serverless` | PlanetScale 无服务器 |
+| TiDB Serverless | `drizzle-orm/tidb-serverless` | TiDB Cloud |
+
+### SQLite
+
+| 驱动 | 导入路径 | 适用场景 |
+| --- | --- | --- |
+| Bun SQLite | `drizzle-orm/bun-sqlite` | Bun 运行时 |
+| better-sqlite3 | `drizzle-orm/better-sqlite3` | Node.js 同步驱动 |
+| Cloudflare D1 | `drizzle-orm/d1` | Workers + D1 |
+| libSQL / Turso | `drizzle-orm/libsql` | 远程 SQLite、边缘复制 |
+| Expo SQLite | `drizzle-orm/expo-sqlite` | React Native / Expo |
+| Op-SQLite | `drizzle-orm/op-sqlite` | React Native 高性能驱动 |
+
+### 其他数据库
+
+- SingleStore：`drizzle-orm/singlestore`
+- Gel：`drizzle-orm/gel`
+
+<Callout type="info" title="以官方文档为准">
+驱动列表会随版本更新。新增适配器与具体连接参数请查阅官方文档的「Connect」章节，或直接查看对应包的类型定义。
+</Callout>
+
+## 与框架和平台集成
+
+Drizzle 不绑定框架，因此集成方式通常是「在框架的数据库初始化位置接入驱动」：
+
+- **Astro**：在 `src/db` 中初始化，按需在端点或服务端组件中调用。
+- **Next.js**：在服务端模块或 Route Handler 中复用连接池。
+- **Hono / Cloudflare Workers**：从 `env` 获取 D1 绑定，按请求创建轻量客户端。
+- **Bun / Deno**：直接使用内置 SQLite 或 postgres.js。
+- **Better Auth 等认证库**：许多社区库提供 Drizzle 适配器，可直接复用同一份 schema。
+
+## 学习资源
+
+- [官方文档](https://orm.drizzle.team/docs/overview)
+- [GitHub 仓库](https://github.com/drizzle-team/drizzle-orm)
+- [Discord 社区](https://drizzle.team/discord)
+- 本中文文档的[快速开始](/docs/quickstart)与[迁移指南](/docs/migrations)
+
+## 下一步
+
+- [连接数据库](/docs/connections)：各驱动的具体初始化代码
+- [性能](/docs/performance)：在边缘运行时保持轻量
+- [常见问题](/docs/faq)：版本、方言与工具选择

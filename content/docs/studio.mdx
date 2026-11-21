@@ -1,0 +1,104 @@
+---
+title: Drizzle Studio
+description: 使用 Drizzle Studio 在本地浏览、查询与编辑数据库，并了解访问控制与安全注意事项。
+---
+
+Drizzle Studio 是随 `drizzle-kit` 提供的可视化数据库浏览器。它读取同一份 `drizzle.config.ts`，连接到你的数据库，让你在不写 SQL 的情况下查看表结构、筛选记录并编辑数据。
+
+## 启动
+
+```bash
+bunx drizzle-kit studio
+```
+
+终端会输出本地地址（默认通过 `https://local.drizzle.studio` 连接本机服务）。也可以使用脚本：
+
+```json title="package.json"
+{
+  "scripts": {
+    "db:studio": "drizzle-kit studio"
+  }
+}
+```
+
+常用参数：
+
+```bash
+bunx drizzle-kit studio --port 4983
+bunx drizzle-kit studio --host 127.0.0.1
+bunx drizzle-kit studio --config drizzle.studio.config.ts
+bunx drizzle-kit studio --verbose
+```
+
+- `--port`：本地服务端口，默认 `4983`。
+- `--host`：监听地址，默认仅本机。
+- `--config`：使用独立的配置文件（例如连接只读副本）。
+- `--verbose`：输出连接与请求日志。
+
+## 能做什么
+
+- 按表浏览数据，支持分页与列筛选
+- 直接新增、编辑、删除记录
+- 查看列类型、默认值、索引与外键
+- 快速验证迁移后的结构与数据
+- 调试种子数据与枚举值
+
+<Callout type="warn" title="Studio 不是生产管理后台">
+Studio 面向本地开发与受控环境。不要把带有写权限的生产连接暴露给公网，也不要在共享机器上长期保持会话。
+</Callout>
+
+## 使用独立配置
+
+为 Studio 单独准备一份配置，指向本地或只读副本，避免误操作生产库：
+
+```ts title="drizzle.studio.config.ts"
+import 'dotenv/config';
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './src/db/schema.ts',
+  dbCredentials: {
+    url: process.env.STUDIO_DATABASE_URL!,
+  },
+});
+```
+
+```bash
+bunx drizzle-kit studio --config drizzle.studio.config.ts
+```
+
+## 安全建议
+
+1. **最小权限**：为 Studio 使用独立数据库账号；只读场景下不要授予 `INSERT`/`UPDATE`/`DELETE`。
+2. **不要暴露端口**：默认只监听 `127.0.0.1`。需要远程访问时，使用 SSH 隧道或平台提供的安全通道，而不是直接把端口开到公网。
+3. **区分环境变量**：使用 `STUDIO_DATABASE_URL` 之类的专用变量，避免误连生产库。
+4. **谨慎编辑**：界面中的删除操作会真实执行 SQL；对关键表建议先在本地副本验证。
+5. **用完即关**：开发结束后停止进程，避免长期驻留。
+
+<Callout type="info" title="远程数据库">
+对托管数据库，官方提供了 Drizzle Gateway 等方案来安全地连接 Studio。具体支持范围与配置方式请参考官方文档，并优先选择平台推荐的安全连接方式。
+</Callout>
+
+## 常见问题
+
+<Accordions>
+<Accordion title="端口被占用">
+通过 `--port` 换一个端口，或检查是否有残留的 studio 进程。
+</Accordion>
+<Accordion title="连接超时或 SSL 错误">
+确认数据库允许来自本机的连接，并检查连接串中的 `sslmode` 或 `ssl` 配置。云数据库通常需要显式开启 SSL。
+</Accordion>
+<Accordion title="看不到部分表">
+检查 `schema` 配置是否包含所有 schema 文件，以及目标表是否位于当前账号可访问的 schema 中。
+</Accordion>
+<Accordion title="修改数据后应用无感知">
+Studio 直接修改数据库，不会触发表层面的缓存失效。应用侧若有缓存或物化视图，需要自行刷新。
+</Accordion>
+</Accordions>
+
+## 下一步
+
+- [drizzle-kit CLI](/docs/drizzle-kit)：完整的命令参考
+- [迁移](/docs/migrations)：在执行 Studio 操作前先让结构保持一致
+- [生态系统](/docs/ecosystem)：了解 drizzle-seed 等配套工具

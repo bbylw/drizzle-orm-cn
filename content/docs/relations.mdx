@@ -1,0 +1,231 @@
+---
+title: 关联查询
+description: 使用 relations 定义一对多、多对一与多对多关系，并通过 db.query 一次获取嵌套结构。
+---
+
+查询构建器适合扁平的结果，而真实页面往往需要嵌套数据：用户及其文章、订单及订单项。Drizzle 的关系查询（Relational Queries）让你在 schema 中声明关系，然后在查询时用 `with` 描述想要的树形结构。
+
+<Callout type="info" title="关系查询不替代 joins">
+关系查询构建在底层 join 之上，适合「对象图」形状的结果；报表、聚合与复杂过滤仍然建议直接使用查询构建器。
+</Callout>
+
+## 定义关系
+
+假设已有 `users` 与 `posts` 两张表：
+
+```ts title="src/db/schema.ts"
+import { integer, pgTable, text, uuid } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name').notNull(),
+});
+
+export const posts = pgTable('posts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  authorId: uuid('author_id')
+    .notNull()
+    .references(() => users.id),
+  title: text('title').notNull(),
+});
+```
+
+在单独的文件中声明关系：
+
+```ts title="src/db/relations.ts"
+import { relations } from 'drizzle-orm';
+import { posts, users } from './schema';
+
+export const usersRelations = relations(users, ({ many }) => ({
+  posts: many(posts),
+}));
+
+export const postsRelations = relations(posts, ({ one }) => ({
+  author: one(users, {
+    fields: [posts.authorId],
+    references: [users.id],
+  }),
+}));
+```
+
+关系名（`posts`、`author`）完全由你决定，它只是查询时的字段名。
+
+## 将 schema 传给 drizzle
+
+关系查询需要在初始化时注册 schema：
+
+```ts title="src/db/index.ts"
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from './schema';
+import * as relations from './relations';
+
+export const db = drizzle(process.env.DATABASE_URL!, {
+  schema: { ...schema, ...relations },
+});
+```
+
+如果把关系和表放在同一目录，也可以统一从 `schema/index.ts` 导出后整体传入。
+
+## 查询嵌套数据
+
+```ts
+const result = await db.query.users.findMany({
+  columns: {
+    id: true,
+    name: true,
+  },
+  with: {
+    posts: {
+      columns: { id: true, title: true },
+      orderBy: (posts, { desc }) => [desc(posts.id)],
+      limit: 5,
+    },
+  },
+});
+```
+
+返回类型会自动推导为：
+
+```ts
+{
+  id: string;
+  name: string;
+  posts: { id: string; title: string }[];
+}[]
+```
+
+`columns` 与 `with` 都是可选的；不传 `columns` 时返回全部列。`where`、`orderBy`、`limit`、`offset` 的用法与查询构建器一致。
+
+## 多对多
+
+多对多通过中间表表达：
+
+```ts title="src/db/schema.ts"
+export const tags = pgTable('tags', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name').notNull().unique(),
+});
+
+export const postTags = pgTable(
+  'post_tags',
+  {
+    postId: uuid('post_id').notNull().references(() => posts.id),
+    tagId: uuid('tag_id').notNull().references(() => tags.id),
+  },
+  (table) => [primaryKey({ columns: [table.postId, table.tagId] })],
+);
+```
+
+```ts title="src/db/relations.ts"
+export const postsRelations = relations(posts, ({ many }) => ({
+  tags: many(postTags),
+}));
+
+export const tagsRelations = relations(tags, ({ many }) => ({
+  posts: many(postTags),
+}));
+
+export const postTagsRelations = relations(postTags, ({ one }) => ({
+  post: one(posts, {
+    fields: [postTags.postId],
+    references: [posts.id],
+  }),
+  tag: one(tags, {
+    fields: [postTags.tagId],
+    references: [tags.id],
+  }),
+}));
+```
+
+查询时通过中间表继续嵌套：
+
+```ts
+const rows = await db.query.posts.findMany({
+  with: {
+    tags: {
+      with: {
+        tag: true,
+      },
+    },
+  },
+});
+```
+
+结果中每个 post 带有 `tags: { post, tag }[]`。如果希望直接返回标签数组，可以在应用层做一次映射：
+
+```ts
+const simplified = rows.map((post) => ({
+  ...post,
+  tags: post.tags.map((link) => link.tag),
+}));
+```
+
+## 一对一的写法
+
+一对一仍然使用 `one`，但外键列需要有唯一约束：
+
+```ts
+export const profiles = pgTable('profiles', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id')
+    .notNull()
+    .unique()
+    .references(() => users.id),
+  bio: text('bio'),
+});
+
+export const usersRelations = relations(users, ({ one }) => ({
+  profile: one(profiles, {
+    fields: [users.id],
+    references: [profiles.userId],
+  }),
+}));
+```
+
+## 过滤与分页
+
+```ts
+const users = await db.query.users.findMany({
+  where: (users, { eq }) => eq(users.role, 'admin'),
+  orderBy: (users, { desc }) => [desc(users.createdAt)],
+  limit: 20,
+  offset: 0,
+});
+```
+
+回调参数中的运算符集合避免了你手动导入 `eq`、`desc` 等函数；也可以直接使用外层导入的运算符。
+
+对子关系单独过滤：
+
+```ts
+const users = await db.query.users.findMany({
+  with: {
+    posts: {
+      where: (posts, { eq }) => eq(posts.status, 'published'),
+    },
+  },
+});
+```
+
+需要注意：对子关系使用 `where` 时，父记录仍会返回（没有匹配文章时 `posts` 为空数组）。如果你需要「只返回至少有一篇文章的用户」，请使用 `innerJoin` 或 `exists`。
+
+## joins 还是关系查询？
+
+| 场景 | 推荐方式 |
+| --- | --- |
+| 页面需要层级结构（用户 + 最近文章） | 关系查询 |
+| 报表、聚合、分组统计 | 查询构建器 + join |
+| 复杂条件跨多表过滤 | 查询构建器，必要时子查询 |
+| 需要严格控制生成的 SQL | 查询构建器 |
+
+两者的类型都来自同一份 schema，可以按需混用。
+
+## 关于 v1 Beta
+
+Drizzle ORM v1 Beta 引入了新的关系定义方式与关系查询 v2（`defineRelations` 等），部分签名与当前稳定版不同。本站示例基于稳定版 `relations()` API；升级前请阅读官方 v1 迁移指南，并锁定依赖版本。
+
+## 下一步
+
+- [迁移](/docs/migrations)：让关系对应的外键真正落库
+- [性能](/docs/performance)：避免 N+1 查询
+- [查询构建器](/docs/queries)：回顾 join 与聚合

@@ -1,0 +1,115 @@
+---
+title: 概览
+description: Drizzle ORM 是「活在 TypeScript 里的 SQL」——类型优先、零代码生成的 TypeScript SQL ORM。
+---
+
+<Callout type="info" title="非官方中文文档">
+本站依据 Drizzle 官方 README 与文档整理翻译，与 Drizzle Team 无隶属关系。如果译文与英文原文存在出入，请以[官方英文文档](https://orm.drizzle.team/docs/overview)为准。
+</Callout>
+
+Drizzle ORM 是一个为 SQL 数据库设计的 TypeScript ORM。它不隐藏 SQL，也不发明另一套查询语言：**schema 就是 TypeScript 代码，查询构建器就是 SQL 的镜像，结果类型由 schema 自动推导**。
+
+它看起来像 SQL，用起来像 TypeScript：
+
+```ts
+import { eq } from 'drizzle-orm';
+import { db } from './db';
+import { users } from './db/schema';
+
+const admins = await db
+  .select({ id: users.id, email: users.email })
+  .from(users)
+  .where(eq(users.role, 'admin'));
+//    ^? { id: number; email: string }[]
+```
+
+## 一段代码，读懂 Drizzle
+
+一个数据库、一份 schema、一条查询，就构成了 Drizzle 的最小闭环。
+
+```ts title="src/db/schema.ts"
+import { integer, pgTable, timestamp, varchar } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+  name: varchar('name', { length: 255 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+```
+
+```ts title="src/db/index.ts"
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from './schema';
+
+export const db = drizzle(process.env.DATABASE_URL!, { schema });
+```
+
+```ts title="src/example.ts"
+import { db } from './db';
+import { users } from './db/schema';
+
+const result = await db.select().from(users);
+```
+
+没有生成目录、没有守护进程、没有运行时元数据扫描。导入 `users`，类型就已经存在。
+
+## 核心特性
+
+### SQL 优先的查询构建器
+
+`select`、`join`、`groupBy`、`having`、CTE、窗口函数——Drizzle 的 API 与 SQL 概念一一对应。你不需要把查询「翻译」成 ORM 抽象，也不必为复杂查询退回裸 SQL 字符串。
+
+### 类型安全贯穿始终
+
+schema 是唯一事实来源。列的可空性、默认值、枚举、关联关系都会反映到查询参数和返回类型中。修改 schema 后，编译器会指出所有需要跟进的位置。
+
+### 零代码生成
+
+schema 直接写在 `.ts` 文件里，不经过 codegen 步骤。没有需要提交的生成产物，也没有需要保持同步的客户端。
+
+### 无头（headless）、无绑定
+
+Drizzle 不捆绑连接池、不托管数据库、不要求特定运行时。你可以使用任意驱动，部署到 Node.js、Bun、Deno、Cloudflare Workers、Vercel 或你自己的服务器。
+
+### 可审查的迁移
+
+`drizzle-kit` 对比 schema 差异并生成普通 SQL 文件。迁移在合并前可以被逐行审查、在 CI 中校验、在部署时按顺序执行。
+
+### 极小的运行时足迹
+
+`drizzle-orm` 没有沉重的运行时依赖，在无服务器和边缘环境中冷启动开销小，适合对包体积敏感的应用。
+
+## 支持的数据库
+
+| 数据库 | 常用驱动与适配器 | 迁移方言 |
+| --- | --- | --- |
+| PostgreSQL | node-postgres、postgres.js、Neon、Supabase、Xata、PGlite、AWS Data API | `postgresql` |
+| MySQL | mysql2、PlanetScale、TiDB Serverless | `mysql` |
+| SQLite | better-sqlite3、Bun SQLite、Cloudflare D1、libSQL / Turso、Expo SQLite、Op-SQLite | `sqlite` |
+| 其他 | SingleStore、Gel | `singlestore`、`gel` |
+
+完整驱动列表与连接方式见[连接数据库](/docs/connections)和[生态系统](/docs/ecosystem)。
+
+## 文档导览
+
+<Cards>
+  <Card title="快速开始" href="/docs/quickstart" description="十分钟完成安装、建表、迁移与第一次查询。" />
+  <Card title="为什么选择 Drizzle" href="/docs/why-drizzle" description="理解 Drizzle 的设计取舍，以及它适合什么样的项目。" />
+  <Card title="Schema 与类型" href="/docs/schema" description="用 TypeScript 描述表、列、约束、索引与类型推断。" />
+  <Card title="查询构建器" href="/docs/queries" description="从 select 到 CTE，掌握 SQL 在 Drizzle 中的表达方式。" />
+  <Card title="关联查询" href="/docs/relations" description="定义表关系，一次取出嵌套的数据结构。" />
+  <Card title="迁移与工具链" href="/docs/migrations" description="用 drizzle-kit 生成、审查并执行 SQL 迁移。" />
+</Cards>
+
+## 版本说明
+
+<Callout type="warn" title="关于 v1 Beta">
+Drizzle ORM v1 已进入 Beta，其中关系查询（Relations）相关 API 仍在演进。本站示例以当前稳定版 API 为主；涉及 v1 差异的地方会单独标注。生产项目请锁定锁定版本，并以官方迁移指南为准。
+</Callout>
+
+## 下一步
+
+- 想先跑起来：[快速开始](/docs/quickstart)
+- 想理解设计哲学：[为什么选择 Drizzle](/docs/why-drizzle)
+- 已在其他 ORM 上踩过坑：[迁移与 drizzle-kit](/docs/drizzle-kit)

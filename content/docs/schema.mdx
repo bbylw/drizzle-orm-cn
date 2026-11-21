@@ -1,0 +1,227 @@
+---
+title: Schema 与类型
+description: 用 TypeScript 定义表、列、约束、索引与外键，并从 schema 推导插入与查询类型。
+---
+
+在 Drizzle 中，schema 不是配置，而是普通 TypeScript 模块。每个表由对应方言的核心包定义：`drizzle-orm/pg-core`、`drizzle-orm/mysql-core` 或 `drizzle-orm/sqlite-core`。
+
+## 定义第一张表
+
+```ts title="src/db/schema.ts"
+import {
+  index,
+  integer,
+  pgEnum,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
+
+export const role = pgEnum('role', ['admin', 'member']);
+
+export const users = pgTable(
+  'users',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    email: text('email').notNull(),
+    name: text('name').notNull(),
+    role: role('role').default('member').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex('users_email_idx').on(table.email)],
+);
+```
+
+一条经验：**显式写出列名**（如 `text('email')`）。这样数据库中的命名完全可控，也方便对接既有表。
+
+## 常用列类型（PostgreSQL）
+
+| TypeScript 构建器 | 数据库类型 | 运行时值 |
+| --- | --- | --- |
+| `integer()` | `integer` | `number` |
+| `bigint({ mode: 'number' })` | `bigint` | `number` |
+| `bigint({ mode: 'bigint' })` | `bigint` | `bigint` |
+| `numeric({ precision, scale })` | `numeric` | 默认 `string` |
+| `real()` / `doublePrecision()` | 浮点 | `number` |
+| `text()` / `varchar({ length })` | `text` / `varchar` | `string` |
+| `boolean()` | `boolean` | `boolean` |
+| `timestamp({ withTimezone: true })` | `timestamptz` | `Date` |
+| `date({ mode: 'date' })` | `date` | `Date` |
+| `jsonb()` / `json()` | `jsonb` / `json` | 结构化类型 |
+| `uuid()` | `uuid` | `string` |
+
+金额请使用 `numeric` 并保持字符串处理，避免浮点误差；需要更精确或超出 `number` 范围的整数，使用 `bigint` 的 `bigint` 模式。
+
+## 约束与默认值
+
+```ts
+const posts = pgTable('posts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  title: text('title').notNull(),
+  slug: text('slug').notNull().unique(),
+  views: integer('views').default(0).notNull(),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+});
+```
+
+- `.notNull()` 影响插入与查询两端的类型。
+- `.default(...)` 让插入时该字段变为可选。
+- `.primaryKey()`、`.unique()` 会进入迁移 SQL。
+- 可空列在查询结果中的类型为 `T | null`。
+
+## 类型推断
+
+```ts
+export type User = typeof users.$inferSelect;
+//    ^? { id: string; email: string; name: string; role: 'admin' | 'member'; createdAt: Date }
+
+export type NewUser = typeof users.$inferInsert;
+//    ^? { id?: string; email: string; name: string; role?: 'admin' | 'member'; createdAt?: Date }
+```
+
+也可以直接在函数签名中使用：
+
+```ts
+async function createUser(data: typeof users.$inferInsert) {
+  const [user] = await db.insert(users).values(data).returning();
+  return user;
+}
+```
+
+`$inferSelect` / `$inferInsert` 只依赖 schema 的类型信息，不会产生运行时开销。
+
+## 自定义类型
+
+对于数据库中的特殊类型（如 PostGIS 几何、加密列），可以用 `$type` 覆盖 TypeScript 类型：
+
+```ts
+import { customType } from 'drizzle-orm/pg-core';
+
+const geometry = customType<{ data: { lat: number; lng: number }; driverData: string }>({
+  dataType() {
+    return 'geometry(Point, 4326)';
+  },
+  fromDriver(value) {
+    const [lat, lng] = value.slice(6, -1).split(' ').map(Number);
+    return { lat, lng };
+  },
+  toDriver({ lat, lng }) {
+    return `POINT(${lng} ${lat})`;
+  },
+});
+```
+
+`$type<T>()` 也可以直接标注已有列，但要确保运行时值真的符合该类型。
+
+## 索引与外键
+
+```ts
+export const posts = pgTable(
+  'posts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    authorId: uuid('author_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('posts_author_idx').on(table.authorId),
+    index('posts_created_idx').on(table.createdAt),
+  ],
+);
+```
+
+- 外键列应为 `NOT NULL`，并单独建索引（PostgreSQL 不会自动为外键建索引）。
+- `onDelete` 支持 `cascade`、`set null`、`restrict`、`no action`；`onUpdate` 同理。
+- 复合索引：`index('name').on(table.a, table.b)`。
+- 部分索引：在 `uniqueIndex(...)` 后附加 `where(...)` 条件，可实现软删除场景下的唯一约束。
+
+## 复合主键
+
+```ts
+import { primaryKey } from 'drizzle-orm/pg-core';
+
+export const postTags = pgTable(
+  'post_tags',
+  {
+    postId: uuid('post_id').notNull().references(() => posts.id),
+    tagId: uuid('tag_id').notNull().references(() => tags.id),
+  },
+  (table) => [primaryKey({ columns: [table.postId, table.tagId] })],
+);
+```
+
+## 组织 schema 文件
+
+小项目可以只用 `src/db/schema.ts`；项目变大后按领域拆分：
+
+```text
+src/db/schema/
+├── index.ts   # 统一导出
+├── users.ts
+├── posts.ts
+└── orders.ts
+```
+
+```ts title="src/db/schema/index.ts"
+export * from './users';
+export * from './posts';
+export * from './orders';
+```
+
+外键与关系请使用回调形式（`references(() => users.id)`），避免模块循环依赖。
+
+## 方言差异
+
+<Tabs items={['MySQL', 'SQLite']}>
+<Tab value="MySQL">
+
+```ts title="src/db/schema.ts"
+import { int, mysqlTable, timestamp, varchar } from 'drizzle-orm/mysql-core';
+
+export const users = mysqlTable('users', {
+  id: int('id').autoincrement().primaryKey(),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+```
+
+- 自增使用 `int().autoincrement()`。
+- `timestamp` 与 `datetime` 的精度通过 `{ fsp: 3 }` 控制。
+- 索引定义方式与 PostgreSQL 类似，通过 `index()` / `uniqueIndex()`。
+
+</Tab>
+<Tab value="SQLite">
+
+```ts title="src/db/schema.ts"
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const users = sqliteTable('users', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  email: text('email').notNull().unique(),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+```
+
+- SQLite 使用动态类型，`integer` + `mode` 决定运行时是 `number`、`boolean` 还是 `Date`。
+- `$defaultFn()` 在应用侧生成默认值，常见于时间戳与 UUID。
+- 外键约束默认可能未开启，需要在连接时执行 `PRAGMA foreign_keys = ON`。
+
+</Tab>
+</Tabs>
+
+<Callout type="info" title="Schema 是迁移的源头">
+`drizzle-kit` 通过对比 schema 与迁移快照生成 SQL。修改 schema 后记得运行 `drizzle-kit generate`，并审查生成的迁移文件。
+</Callout>
+
+## 下一步
+
+- [查询构建器](/docs/queries)：基于 schema 编写查询
+- [关联查询](/docs/relations)：定义一对多与多对一关系
+- [迁移](/docs/migrations)：将 schema 变更安全地应用到数据库

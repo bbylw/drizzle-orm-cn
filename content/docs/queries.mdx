@@ -1,0 +1,308 @@
+---
+title: 查询构建器
+description: 从 select、where、join 到聚合、CTE 与写入操作，系统掌握 Drizzle 的 SQL 风格查询 API。
+---
+
+Drizzle 的查询构建器与 SQL 保持一一对应：你写什么，就生成什么。所有查询都是惰性的构建过程，调用 `await` 或 `.execute()` 时才真正发送到数据库。
+
+## 基础查询
+
+```ts
+import { desc, eq } from 'drizzle-orm';
+import { db } from './db';
+import { users } from './db/schema';
+
+const admins = await db
+  .select({
+    id: users.id,
+    name: users.name,
+    email: users.email,
+  })
+  .from(users)
+  .where(eq(users.role, 'admin'))
+  .orderBy(desc(users.createdAt))
+  .limit(20)
+  .offset(0);
+```
+
+- `select()` 不传参时返回所有列；传对象时只查询指定列，返回类型也会相应收窄。
+- 查询结果是普通对象数组，没有包装类、没有代理对象。
+
+## 过滤条件
+
+```ts
+import { and, between, eq, gte, ilike, inArray, isNull, or } from 'drizzle-orm';
+
+const rows = await db
+  .select()
+  .from(users)
+  .where(
+    and(
+      eq(users.role, 'member'),
+      gte(users.createdAt, new Date('2026-01-01')),
+      or(isNull(users.bio), ilike(users.name, '%ada%')),
+      inArray(users.id, [1, 2, 3]),
+    ),
+  );
+```
+
+常用运算符：
+
+| 运算符 | SQL 等价 |
+| --- | --- |
+| `eq(a, b)` / `ne(a, b)` | `=` / `<>` |
+| `gt` / `gte` / `lt` / `lte` | 比较运算 |
+| `like(a, '%x%')` / `ilike` | `LIKE` / `ILIKE` |
+| `inArray(a, [...])` | `IN (...)` |
+| `notInArray(a, [...])` | `NOT IN (...)` |
+| `isNull(a)` / `isNotNull(a)` | `IS NULL` / `IS NOT NULL` |
+| `between(a, x, y)` | `BETWEEN` |
+| `exists(subquery)` | `EXISTS (...)` |
+| `and(...)` / `or(...)` / `not(...)` | 逻辑组合 |
+
+<Callout type="info" title="参数化查询">
+所有值都会作为参数绑定，而不是拼接进 SQL 字符串。不要手动拼接用户输入；需要动态标识符时，使用 `sql.identifier()` 并严格校验。
+</Callout>
+
+## 排序与分页
+
+```ts
+const page = 2;
+const pageSize = 20;
+
+const rows = await db
+  .select()
+  .from(posts)
+  .orderBy(desc(posts.publishedAt), desc(posts.id))
+  .limit(pageSize)
+  .offset((page - 1) * pageSize);
+```
+
+排序字段应稳定且唯一（通常追加主键），否则分页时可能出现重复或遗漏。
+
+需要总数时，单独执行计数查询：
+
+```ts
+import { count } from 'drizzle-orm';
+
+const [{ total }] = await db.select({ total: count() }).from(posts);
+```
+
+## Joins
+
+```ts
+const rows = await db
+  .select({
+    userName: users.name,
+    orderId: orders.id,
+    amount: orders.amount,
+  })
+  .from(orders)
+  .innerJoin(users, eq(orders.userId, users.id))
+  .where(eq(orders.status, 'paid'));
+```
+
+| 方法 | SQL |
+| --- | --- |
+| `innerJoin` | `INNER JOIN` |
+| `leftJoin` | `LEFT JOIN` |
+| `rightJoin` | `RIGHT JOIN` |
+| `fullJoin` | `FULL JOIN`（PostgreSQL） |
+| `crossJoin` | `CROSS JOIN` |
+
+自连接需要给表起别名：
+
+```ts
+import { alias } from 'drizzle-orm/pg-core';
+
+const manager = alias(users, 'manager');
+
+const rows = await db
+  .select({ employee: users.name, manager: manager.name })
+  .from(users)
+  .leftJoin(manager, eq(users.managerId, manager.id));
+```
+
+## 聚合与分组
+
+```ts
+import { avg, count, sum } from 'drizzle-orm';
+
+const stats = await db
+  .select({
+    status: orders.status,
+    orders: count(orders.id),
+    revenue: sum(orders.amount),
+    average: avg(orders.amount),
+  })
+  .from(orders)
+  .groupBy(orders.status)
+  .having(gte(sum(orders.amount), 1000));
+```
+
+`count()`、`sum()`、`avg()` 等聚合辅助函数会处理驱动返回字符串的问题；如果使用原生 `sql` 模板，请留意 PostgreSQL 的 `numeric`/`bigint` 可能以字符串返回。
+
+```ts
+import { sql } from 'drizzle-orm';
+
+const [{ total }] = await db
+  .select({ total: sql<string>`coalesce(sum(${orders.amount}), 0)` })
+  .from(orders);
+```
+
+## 原生 SQL 片段
+
+当查询超出构建器表达范围时，可以在保留类型与参数化的前提下嵌入 SQL：
+
+```ts
+const rows = await db
+  .select({
+    id: users.id,
+    domain: sql<string>`split_part(${users.email}, '@', 2)`,
+  })
+  .from(users);
+```
+
+请只拼接可信的列引用，不要把用户输入直接放进模板字符串。
+
+## 子查询与 CTE
+
+```ts
+import { exists } from 'drizzle-orm';
+
+const usersWithPaidOrders = await db
+  .select({ id: users.id, email: users.email })
+  .from(users)
+  .where(
+    exists(
+      db
+        .select({ one: sql`1` })
+        .from(orders)
+        .where(and(eq(orders.userId, users.id), eq(orders.status, 'paid'))),
+    ),
+  );
+```
+
+```ts
+const activeUsers = db.$with('active_users').as(
+  db.select({ id: users.id }).from(users).where(eq(users.active, true)),
+);
+
+const rows = await db
+  .with(activeUsers)
+  .select({ id: orders.id })
+  .from(orders)
+  .innerJoin(activeUsers, eq(orders.userId, activeUsers.id));
+```
+
+## 写入操作
+
+### Insert
+
+```ts
+await db.insert(users).values({
+  name: 'Grace Hopper',
+  email: 'grace@example.com',
+});
+
+// 批量插入与返回
+const inserted = await db
+  .insert(users)
+  .values([
+    { name: 'Ada', email: 'ada@example.com' },
+    { name: 'Alan', email: 'alan@example.com' },
+  ])
+  .returning({ id: users.id });
+```
+
+冲突处理：
+
+```ts
+await db
+  .insert(users)
+  .values({ name: 'Ada', email: 'ada@example.com' })
+  .onConflictDoUpdate({
+    target: users.email,
+    set: { name: 'Ada Lovelace' },
+  });
+
+await db
+  .insert(users)
+  .values({ name: 'Ada', email: 'ada@example.com' })
+  .onConflictDoNothing();
+```
+
+### Update
+
+```ts
+const updated = await db
+  .update(posts)
+  .set({ title: '新的标题', updatedAt: new Date() })
+  .where(eq(posts.id, postId))
+  .returning();
+```
+
+<Callout type="warn" title="不要省略 where">
+`db.update(...)` 与 `db.delete(...)` 不传 `where` 会作用于整张表。建议在代码审查中特别关注这两个方法。
+</Callout>
+
+### Delete
+
+```ts
+await db.delete(posts).where(eq(posts.id, postId));
+```
+
+## 预编译与占位符
+
+```ts
+import { sql } from 'drizzle-orm';
+
+const findUser = db
+  .select()
+  .from(users)
+  .where(eq(users.id, sql.placeholder('id')))
+  .prepare('find_user');
+
+const user = await findUser.execute({ id: 1 });
+```
+
+适合在请求密集的服务中复用。注意不同驱动的预编译支持程度不同。
+
+## 查看生成的 SQL
+
+```ts
+const query = db
+  .select()
+  .from(users)
+  .where(eq(users.role, 'admin'))
+  .toSQL();
+
+console.log(query.sql); // select "id", ... from "users" where "users"."role" = $1
+console.log(query.params); // ['admin']
+```
+
+`.toSQL()` 不会执行查询，是排查问题与审查代码的首选工具。
+
+## 动态构建查询
+
+```ts
+let query = db.select().from(users).$dynamic();
+
+if (filters.role) {
+  query = query.where(eq(users.role, filters.role));
+}
+
+if (filters.limit) {
+  query = query.limit(filters.limit);
+}
+
+const rows = await query;
+```
+
+`$dynamic()` 会让构建器的返回类型允许后续继续拼接。它不会改变运行时行为。
+
+## 下一步
+
+- [关联查询](/docs/relations)：用 `db.query` 取出嵌套结构
+- [事务](/docs/transactions)：多条写入的原子性
+- [性能](/docs/performance)：索引、列裁剪与 N+1

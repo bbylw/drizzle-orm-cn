@@ -1,0 +1,125 @@
+---
+title: 常见问题
+description: 关于 Drizzle 的方言支持、代码生成、迁移、版本差异与边缘部署的常见疑问。
+---
+
+<Callout type="info" title="关于本站">
+本文档是非官方中文翻译，与 Drizzle Team 无隶属关系。若与官方英文文档不一致，请以[官方文档](https://orm.drizzle.team/docs/overview)和[GitHub README](https://github.com/drizzle-team/drizzle-orm/blob/main/README.md)为准。
+</Callout>
+
+## 基础
+
+<Accordions>
+<Accordion title="Drizzle 支持哪些数据库？">
+官方支持 PostgreSQL、MySQL、SQLite、SingleStore 与 Gel。每种方言都有多种驱动适配，覆盖 Node.js、Bun、Deno、Cloudflare Workers、React Native 等运行时。完整列表见[生态系统](/docs/ecosystem)。
+</Accordion>
+
+<Accordion title="Drizzle 是 MongoDB 的 ORM 吗？">
+不是。Drizzle 只面向 SQL 数据库，不提供文档数据库的抽象。如果你的数据模型是文档型的，Drizzle 不是合适的选择。
+</Accordion>
+
+<Accordion title="需要代码生成吗？">
+不需要。schema 直接写在 TypeScript 文件中，运行时与编辑器都直接读取它。唯一的「生成」步骤是 `drizzle-kit generate`，它生成的是数据库迁移 SQL，而不是客户端代码。
+</Accordion>
+
+<Accordion title="必须使用 drizzle-kit 吗？">
+不是必须。你可以只用 `drizzle-orm` 写查询，用任何方式管理数据库结构。但推荐使用 drizzle-kit，因为它能把 schema 变更转换成可审查、可重放的 SQL 迁移。
+</Accordion>
+
+<Accordion title="Drizzle 会扫描数据库元数据吗？">
+不会。普通查询不依赖运行时元数据，也不需要连接数据库来推导类型；所有类型都来自 schema 的静态定义。关系查询需要你在初始化时传入 schema，但它同样不扫描数据库。
+</Accordion>
+</Accordions>
+
+## 查询
+
+<Accordions>
+<Accordion title="如何查看实际执行的 SQL？">
+在查询末尾调用 `.toSQL()`，它会返回 `{ sql, params }`，不会执行查询：
+
+```ts
+const { sql, params } = db.select().from(users).where(eq(users.id, 1)).toSQL();
+console.log(sql, params);
+```
+
+也可以在开发环境初始化时开启 `logger: true`。
+</Accordion>
+
+<Accordion title="可以写原生 SQL 吗？">
+可以。通过 `sql` 模板可以嵌入原生片段，同时保留参数绑定：
+
+```ts
+import { sql } from 'drizzle-orm';
+
+const rows = await db.execute(sql`select * from users where id = ${id}`);
+```
+
+不要用字符串拼接用户输入，避免 SQL 注入。
+</Accordion>
+
+<Accordion title="支持事务和行级锁吗？">
+支持 `db.transaction()`。PostgreSQL/MySQL 支持隔离级别与 `FOR UPDATE` 行级锁；SQLite 的选项与行为不同。详见[事务](/docs/transactions)。
+</Accordion>
+
+<Accordion title="类型为什么和数据库里的值不一致？">
+常见于 `numeric`、`bigint`、时间戳等类型：PostgreSQL 驱动可能以字符串返回 `numeric`/`bigint`，而 SQLite 需要 `mode` 指定运行时类型。请在 schema 中显式选择模式，或使用聚合辅助函数处理转换。
+</Accordion>
+</Accordions>
+
+## 迁移与工具
+
+<Accordions>
+<Accordion title="push 和 migrate 应该用哪个？">
+开发原型可以用 `drizzle-kit push` 快速同步结构；生产环境应使用 `generate` + `migrate`，确保每次变更都是可审查的 SQL 文件，并能按顺序在不同环境重放。
+</Accordion>
+
+<Accordion title="为什么生成的迁移会删掉我的数据？">
+改列名、改类型可能被识别为「删除旧列 + 新增列」。执行前请审查 SQL；对这类变更使用自定义迁移手写 `ALTER TABLE ... RENAME COLUMN`，或按「扩展 → 迁移 → 收缩」分阶段处理。
+</Accordion>
+
+<Accordion title="可以修改已经应用过的迁移文件吗？">
+不可以。已应用到共享环境的迁移应视为不可变历史。需要修正时追加新迁移，否则不同环境的迁移历史会分叉。
+</Accordion>
+
+<Accordion title="如何把现有数据库接入 Drizzle？">
+使用 `bunx drizzle-kit pull` 反向生成 schema，再人工整理命名与组织，随后建立迁移基线。接入前先在副本上验证生成结果。
+</Accordion>
+</Accordions>
+
+## 版本与运行时
+
+<Accordions>
+<Accordion title="v1 Beta 和当前稳定版的 relations 为什么不一样？">
+v1 正在重构关系查询 API（新关系定义与查询 v2），部分签名与稳定版不同。升级前请阅读官方迁移指南、锁定依赖版本，并优先在独立分支验证。本站示例以稳定版 API 为主，相关页面会单独标注。
+</Accordion>
+
+<Accordion title="可以在 Cloudflare Workers / D1 中使用吗？">
+可以。Workers 中使用 `drizzle-orm/d1`，从请求的 `env` 获取 D1 绑定；其他边缘数据库使用对应的 HTTP 驱动。注意边缘运行时没有 TCP，且交互式事务能力有限。
+</Accordion>
+
+<Accordion title="在无服务器环境里如何管理连接？">
+优先使用平台提供的连接池或 HTTP 驱动，避免每个请求新建数据库连接而不释放。长驻 Node 服务则复用单个连接池。详见[连接数据库](/docs/connections)。
+</Accordion>
+
+<Accordion title="如何锁定版本？">
+将 `drizzle-orm`、`drizzle-kit` 与驱动包写入精确版本或使用 lockfile，并在 CI 中固定安装方式。升级时先运行 `drizzle-kit up` 处理快照格式变化，再生成迁移。
+</Accordion>
+</Accordions>
+
+## 关于中文文档
+
+<Accordions>
+<Accordion title="发现翻译错误怎么办？">
+本站是非官方项目。翻译问题会随官方文档更新而调整；涉及 API 行为的疑问，请以官方英文文档或源码类型定义为准。
+</Accordion>
+
+<Accordion title="内容为什么可能与最新版本不一致？">
+上游文档与代码持续更新，中文翻译存在滞后。遇到行为差异时，优先检查 `drizzle-orm` 与 `drizzle-kit` 的实际版本，并对照官方文档。
+</Accordion>
+</Accordions>
+
+## 还没解决？
+
+- 阅读[官方文档](https://orm.drizzle.team/docs/overview)
+- 在 [GitHub Discussions](https://github.com/drizzle-team/drizzle-orm/discussions) 提问
+- 加入 [Discord 社区](https://drizzle.team/discord)
