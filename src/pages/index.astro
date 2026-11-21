@@ -172,13 +172,8 @@ const quickLinks = [
   <div class="landing flex min-h-screen flex-col bg-[#08090a] text-[#f1f3ed]">
     <header class="sticky top-0 z-50 border-b border-white/[0.07] bg-[#08090a]/80 backdrop-blur-xl">
       <div class="mx-auto flex h-[60px] w-full max-w-[1200px] items-center gap-8 px-5 md:px-8">
-        <a href="/" class="flex shrink-0 items-center gap-2.5" aria-label="Drizzle 中文文档首页">
+        <a href="/" class="flex shrink-0 items-center gap-2.5" aria-label="Drizzle 首页">
           <img src="/logo.svg" alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
-          <span
-            class="rounded-full border border-brand/25 bg-brand/10 px-2 py-0.5 text-[10px] font-medium tracking-wide text-brand"
-          >
-            中文文档
-          </span>
         </a>
 
         <nav class="hidden items-center gap-1 md:flex" aria-label="主导航">
@@ -675,7 +670,7 @@ const quickLinks = [
         <div class="mx-auto w-full max-w-[1200px] px-5 py-20 md:px-8 lg:py-24">
           <div class="grid gap-12 lg:grid-cols-[360px_1fr] lg:gap-20">
             <div>
-              <p class="mono-label">// 中文文档</p>
+              <p class="mono-label">// docs</p>
               <h2 class="mt-4 text-3xl font-semibold tracking-[-0.025em] sm:text-[36px] sm:leading-[1.2]">
                 从第一篇文档开始。
               </h2>
@@ -750,15 +745,9 @@ const quickLinks = [
       <div class="mx-auto w-full max-w-[1200px] px-5 py-14 md:px-8">
         <div class="grid gap-10 md:grid-cols-[1.5fr_repeat(3,1fr)]">
           <div>
-            <a href="/" class="inline-flex items-center gap-2.5" aria-label="Drizzle 中文文档首页">
+            <a href="/" class="inline-flex items-center gap-2.5" aria-label="Drizzle 首页">
               <img src="/logo.svg" alt="Drizzle" width="116" height="22" class="h-[21px] w-auto" />
-              <span class="rounded-full border border-brand/25 bg-brand/10 px-2 py-0.5 text-[10px] font-medium text-brand">
-                中文文档
-              </span>
             </a>
-            <p class="mt-4 max-w-[300px] text-[12.5px] leading-6 text-white/35">
-              Drizzle ORM 非官方中文文档。内容基于 Apache-2.0 协议开源的官方文档整理翻译，与 Drizzle Team 无隶属关系。
-            </p>
           </div>
 
           <div>
@@ -775,9 +764,9 @@ const quickLinks = [
           <div>
             <p class="font-mono text-[10.5px] uppercase tracking-[0.16em] text-white/25">资源</p>
             <ul class="mt-4 space-y-2.5 text-[13px]">
-              <li><a class="text-white/50 transition hover:text-brand" href={officialDocs} target="_blank" rel="noreferrer">官方英文文档</a></li>
+              <li><a class="text-white/50 transition hover:text-brand" href={officialDocs} target="_blank" rel="noreferrer">官方文档</a></li>
               <li><a class="text-white/50 transition hover:text-brand" href={officialSite} target="_blank" rel="noreferrer">Drizzle 官网</a></li>
-              <li><a class="text-white/50 transition hover:text-brand" href={githubUrl} target="_blank" rel="noreferrer">GitHub 仓库</a></li>
+              <li><a class="text-white/50 transition hover:text-brand" href={githubUrl} target="_blank" rel="noreferrer">GitHub</a></li>
               <li><a class="text-white/50 transition hover:text-brand" href="/llms.txt">llms.txt</a></li>
             </ul>
           </div>
@@ -793,7 +782,7 @@ const quickLinks = [
         </div>
 
         <div class="mt-12 flex flex-col gap-2 border-t border-white/[0.07] pt-6 font-mono text-[10.5px] uppercase tracking-[0.12em] text-white/25 sm:flex-row sm:items-center sm:justify-between">
-          <span>© 2026 Drizzle 中文文档 · 非官方翻译</span>
+          <span>© 2026 Drizzle · 非官方翻译</span>
           <span>built with astro · fumadocs · bun</span>
         </div>
       </div>

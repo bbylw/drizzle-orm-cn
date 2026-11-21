@@ -64,7 +64,6 @@
     "integrations",
     "ai-agents",
     "---参考---",
-    "faq",
-    "external:[官方英文文档](https://orm.drizzle.team/docs/overview)"
+    "faq"
   ]
 }
