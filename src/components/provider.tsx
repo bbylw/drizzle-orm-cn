@@ -18,7 +18,7 @@ export function Provider({ pathname, params, children }: ProviderProps) {
       pathname={pathname}
       params={params}
       navigate={navigate}
-      theme={{ defaultTheme: 'dark', enableSystem: false }}
+      theme={{ enabled: false }}
       i18n={{ locale: 'zh-CN', translations: uiTranslations }}
       search={{ SearchDialog }}
     >
